@@ -190,55 +190,24 @@ def setup_socket_handlers(
 
     @globals.web_socket.on("update_app")
     def update_app(data):
-        """Pull updates from GitHub and restart the app."""
+        """In-app self-update is DISABLED in this homelab fork (security hardening).
+
+        Upstream ran `git fetch` -> `git reset --hard origin/main` -> `pip install`
+        -> os.execlp() as root from an unauthenticated Socket.IO event. That is a
+        remote-code-execution vector. We update by rebuilding the pinned Docker
+        image from the fork instead (docs/runbooks.md), so this handler is a no-op.
+        """
         instance = Instance(data.get("instance_id"), "web")
-
-        try:
-            update_status(
-                Instance(broadcast=True),
-                "Updating to the latest version, please wait...",
-                "info",
-                sticky=True,
-                spinner=True
-            )
-            update_log(instance, "🔄 Starting update process...")
-
-            # Use the exact same python that is currently running this code:
-            python_cmd = sys.executable
-
-            # Fetch the latest metadata
-            subprocess.run(["git", "fetch", "--all"], check=True)
-
-            # Force move the HEAD to the latest commit on origin/main
-            subprocess.run(["git", "reset", "--hard", "origin/main"], check=True)
-
-            # Re-attach to the local 'main' branch and update its pointer
-            # This is the step that fixes the "HEAD detached" status
-            subprocess.run(["git", "checkout", "-B", "main", "origin/main"], check=True)
-
-            # Clean up any leftover files
-            subprocess.run(["git", "clean", "-fd"], check=True)
-
-            # Install dependencies
-            subprocess.run([python_cmd, "-m", "pip", "install", "-r", "requirements.txt"], check=True)
-
-            # Trigger the front-end to restart
-            update_status(
-                Instance(broadcast=True),
-                "Update complete, restarting the app...",
-                "success",
-                sticky=True,
-                spinner=True
-            )
-            notify_web(Instance(broadcast=True), "backend_restarting", {})
-
-            # Restart the app
-            os.execlp(python_cmd, python_cmd, "artwork_uploader.py")
-
-        except Exception as e:
-            update_status(Instance(broadcast=True), "Update failed, restarting the app...", "danger")
-            update_log(instance, f"❌ Update failed: {str(e)}")
-            notify_web(instance, "update_failed", {"error": str(e)})
+        update_status(
+            Instance(broadcast=True),
+            "In-app update is disabled in this build. Update by rebuilding the Docker image.",
+            "info",
+        )
+        update_log(
+            instance,
+            "⛔ In-app self-update is disabled in this fork (security). "
+            "Rebuild the Docker image to update.",
+        )
 
     @globals.web_socket.on("start_scrape")
     def handle_scrape_from_web(data):
@@ -396,7 +365,9 @@ def setup_socket_handlers(
         url = data.get("url", "")
         debug_me(f"Obtained Plex URL: {url}", "test_plex_connect")
         token = data.get("token", "")
-        debug_me(f"Obtained Plex token: {token}", "test_plex_connect")
+        # Hardened (homelab fork): never log the raw Plex token (was logged in full
+        # when debug mode was on, persisting to the rotating log on disk).
+        debug_me(f"Obtained Plex token: {'[redacted, %d chars]' % len(token) if token else '[empty]'}", "test_plex_connect")
         tv_libs = data.get("tv_libs", "")
         debug_me(f"Obtained {len(tv_libs)} TV libraries: {tv_libs}", "test_plex_connect")
         movie_libs = data.get("movie_libs", "")

@@ -35,8 +35,9 @@ def cook_soup(url):
         soup = BeautifulSoup(response.text, 'html.parser')
         return soup
 
-    elif ".html" in url:
-        with open(url, 'r', encoding='utf-8') as file:
-            html_content = file.read()
-            soup = BeautifulSoup(html_content, 'html.parser')
+    else:
+        # Hardened (homelab fork): upstream had an `elif ".html" in url:` branch that
+        # did open(url) on a caller-supplied path -> arbitrary local file read as root.
+        # Removed; invalid URLs now fail closed.
+        raise ScraperException(f"Invalid or unsupported URL: {url}")
 
