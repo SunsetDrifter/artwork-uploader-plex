@@ -7,13 +7,16 @@ from utils.soup_utils import cook_soup
 
 
 @pytest.mark.unit
-def test_a_local_html_file_comes_back_as_soup(tmp_path):
+def test_an_existing_local_html_file_is_refused(tmp_path):
+    # Homelab fork: the local-file read upstream supports is an arbitrary file read
+    # from a caller-supplied path, so it is removed and must fail closed.
     page = tmp_path / "poster_page.html"
     page.write_text("<html><body><h1>Poster set</h1></body></html>", encoding="utf-8")
 
-    soup = cook_soup(str(page))
+    with pytest.raises(ScraperException) as raised:
+        cook_soup(str(page))
 
-    assert soup.find("h1").text == "Poster set"
+    assert "poster_page.html" in str(raised.value)
 
 
 @pytest.mark.unit
