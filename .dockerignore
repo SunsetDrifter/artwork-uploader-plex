@@ -7,3 +7,16 @@ bulk_imports/*
 # context rather than git, so a build after a first run bakes them into the image.
 config/config.json
 config/.plex_client_id
+
+# Homelab fork: keep VCS, CI, tests, dev scripts and every runtime file out of the image.
+# config/ holds the Plex token, the password hash and atomic-save .tmp files.
+.git
+.github
+tests
+bump_version.py
+config/*
+!config/config.json.example
+logs
+downloads
+uploads
+*.tmp

@@ -49,8 +49,7 @@ class Scraper:
             self.source = ScraperSource.THEPOSTERDB.value
         elif host == "mediux.pro" and ("/sets/" in url or "/boxsets/" in url):
             self.source = ScraperSource.MEDIUX.value
-        elif ".html" in url:
-            self.source = "html"
+        # Hardened (homelab fork): no ".html" route; it fetched any host whose URL contained ".html"
 
 
     # Set options - otherwise will use defaults of False
@@ -72,8 +71,6 @@ class Scraper:
                 self.scrape_theposterdb()
             elif self.source == ScraperSource.MEDIUX.value:
                 self.scrape_mediux()
-            elif self.source == "html":
-                return self.scrape_html()
             else:
                 raise ScraperException(f"Invalid source provided ({self.source if self.source else 'empty source'})")
         except Exception as e:

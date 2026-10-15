@@ -6,6 +6,7 @@ from pprint import pprint
 from models.instance import Instance
 from core.constants import BOOTSTRAP_COLORS, ANSI_RESET, ANSI_BOLD, DEFAULT_LOG_PATH, URL_SOURCE_MAP, URL_TYPE_MAP
 from services.notify_service import NotifyService
+from utils.secret_redaction import describe_apprise_url, redact_for_log
 
 # For backwards compatibility
 bootstrap_colors = BOOTSTRAP_COLORS
@@ -140,7 +141,7 @@ def notify_web(instance: Instance, event, data_to_include = None, silent=False):
         }
         payload = data_to_include or {}
         merged_arguments = payload | instance_data
-        debug_me(f"{ANSI_BOLD}{BOOTSTRAP_COLORS.get('secondary').get('ansi')}[{event}]{ANSI_RESET} {merged_arguments if not silent else instance_data}")
+        debug_me(f"{ANSI_BOLD}{BOOTSTRAP_COLORS.get('secondary').get('ansi')}[{event}]{ANSI_RESET} {redact_for_log(merged_arguments) if not silent else instance_data}")
         globals.web_socket.emit(event, merged_arguments)
 
 def send_notification(instance: Instance, message: str, event: str = None) -> None:
@@ -171,11 +172,11 @@ def send_notification(instance: Instance, message: str, event: str = None) -> No
                 notifier.add_url(url)
                 url_success = notifier.send_notification("Artwork Uploader", message)
                 if url_success:
-                    debug_me(f"📢 Notification sent successfully for URL: {url}")
-                    update_log(instance, f"📢 Notification sent successfully for URL: {url}")
+                    debug_me(f"📢 Notification sent successfully for URL: {describe_apprise_url(url)}")
+                    update_log(instance, f"📢 Notification sent successfully for URL: {describe_apprise_url(url)}")
                 else:
-                    debug_me(f"⚠️ Notification failed to send for URL: {url}")
-                    update_log(instance, f"⚠️ Notification failed to send for URL: {url}")
+                    debug_me(f"⚠️ Notification failed to send for URL: {describe_apprise_url(url)}")
+                    update_log(instance, f"⚠️ Notification failed to send for URL: {describe_apprise_url(url)}")
                 notify_success = notify_success and url_success
                 notifier.clear_urls()
             if len(urls) > 1:

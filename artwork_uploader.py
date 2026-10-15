@@ -1334,7 +1334,10 @@ if __name__ == "__main__":
             web_app.config['SECRET_KEY'] = secrets.token_hex(32)
             web_app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
 
-            globals.web_socket = SocketIO(web_app, cors_allowed_origins="*", async_mode="threading")
+            # Hardened (homelab fork): same-origin socket only (plus external_url), SameSite session cookie
+            from core.web_security import configure_session_cookie, socketio_cors_origins
+            configure_session_cookie(web_app)
+            globals.web_socket = SocketIO(web_app, cors_allowed_origins=socketio_cors_origins(config), async_mode="threading")
 
             # Start update checker using UpdateService
             def on_update_available(version: str):

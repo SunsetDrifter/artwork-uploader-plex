@@ -8,6 +8,8 @@ maintainability.
 import os
 from typing import Optional
 
+from utils.safe_paths import safe_child_path
+
 
 class BulkFileService:
     """Handles bulk import file I/O operations."""
@@ -31,9 +33,12 @@ class BulkFileService:
 
         Returns:
             Full path to the bulk import file
+
+        Raises:
+            UnsafePathError: If the name would resolve outside bulk_imports/ (homelab fork)
         """
         bulk_filename = filename if filename else "bulk_import.txt"
-        return os.path.join(self.base_dir, self.bulk_imports_path, bulk_filename)
+        return safe_child_path(os.path.join(self.base_dir, self.bulk_imports_path), bulk_filename)
 
     def file_exists(self, filename: Optional[str] = None) -> bool:
         """

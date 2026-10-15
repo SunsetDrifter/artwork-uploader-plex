@@ -73,7 +73,7 @@ class PlexConnector:
             except plexapi.exceptions.Unauthorized as e:
                 # Handle authentication-related errors (e.g., invalid token)
                 self.plex = None
-                raise PlexConnectorException(f'Invalid Plex token "{self.token}" -  please check the "token" in config.json or provide one.', f"Invalid Plex token: {str(e)}")
+                raise PlexConnectorException(f'Invalid Plex token -  please check the "token" in config.json or provide one.', f"Invalid Plex token: {str(e)}")
 
             except xml.etree.ElementTree.ParseError as e:
                 # Handle XML parsing errors (e.g., invalid XML response from Plex)

@@ -10,7 +10,7 @@ The routes are organized into:
 - Helper functions for file uploads and processing
 """
 
-import os, logging, flask.cli, sys, re, base64, hmac, shutil, tempfile, zipfile, subprocess, threading, uuid, requests
+import os, logging, flask.cli, sys, re, base64, hmac, shutil, tempfile, zipfile, threading, uuid, requests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from packaging import version
@@ -21,6 +21,9 @@ from functools import wraps
 from core import globals
 from services.notify_service import NotifyService
 from utils.utils import calculate_file_md5, get_host_path
+from utils.safe_paths import safe_child_path, UnsafePathError
+from utils.run_label_html import build_run_label_html
+from utils.secret_redaction import browser_config, describe_apprise_url, filter_client_config
 from models.instance import Instance
 from models.bulk_schedule import BulkSchedule
 from core.config import Config, normalize_notification_channels
@@ -201,7 +204,7 @@ def setup_routes(web_app, config: Config):
 
             query_str = request.query_string.decode("utf-8")
             auth_response_url = f"{redirect_uri}?{query_str}" if query_str else redirect_uri
-            debug_me(f"Constructing auth response URL as {auth_response_url}")
+            debug_me("Constructing OIDC auth response URL")
             oauth.fetch_token(
                 token_url=token_endpoint,
                 authorization_response=auth_response_url,
@@ -533,7 +536,7 @@ def setup_socket_handlers(
         config.load()
         update_scheduled_jobs()
         update_log(instance, "🔄 Configuration loaded")
-        notify_web(instance, "load_config", {"config": vars(config)})
+        notify_web(instance, "load_config", {"config": browser_config(config)})
 
     @globals.web_socket.on("load_bulk_filelist")
     def load_bulk_filelist(data):
@@ -552,14 +555,18 @@ def setup_socket_handlers(
         """Get the contents of a log file and send them back to the frontend"""
         instance = Instance(data.get("instance_id"), "web")
         log_file_name = data.get("log_file_name")
-        full_path = os.path.join(DEFAULT_LOG_PATH, log_file_name)
         log_file_contents = ""
         error = ""
 
         try:
+            # Hardened (homelab fork): the name comes from the browser; keep it inside logs/
+            full_path = safe_child_path(DEFAULT_LOG_PATH, log_file_name)
             with open(full_path, "r", encoding="utf-8") as log_file:
                 log_file_contents = log_file.read()
             debug_me(f"Successfully obtained contents of log file '{log_file_name}'")
+        except UnsafePathError:
+            debug_me(f"Refused to read log file outside the logs folder: {log_file_name!r}")
+            error = "Invalid log file name"
         except OSError as e:
             debug_me(f"Unable to read contents of log file '{log_file_name}': {e.strerror}")
             error = e.strerror
@@ -661,27 +668,10 @@ def setup_socket_handlers(
         for run in all_runs:
             if not run_type or run_type and run.get("run_type") == run_type:
                 runs.append(run)
-                label = run.get("label", "")
-                timestamp = run.get("started_at", "")
-                onclick = f"""onclick="deleteRun('{timestamp}', '{label}')" """
-                if label and "https" in label:
-                    clean_url = label.replace("https://", "").strip()
-                    parts = [p for p in clean_url.split("/") if p]
-                    if len(parts) >= 3:
-                        domain, asset_type, id = parts[0], parts[1], parts[2]
-                        source = URL_SOURCE_MAP.get(domain, "Unknown")
-                        type = URL_TYPE_MAP.get(asset_type, { "icon": "question-circle", "label": "Unknown URL type" })
-                        run["html_label"] = (
-                            f"<a href='{label}' target='_blank' rel='noopener noreferrer' "
-                            f"class='text-decoration-none text-reset' title='{label}'>{source} "
-                            f"<i class='bi bi-{type.get('icon', 'question-circle')}' title='{type.get('label', 'Unknown URL type')}'></i> "
-                            f"<span class='input-monospace' style='font-size: 0.8rem;'>{id}</span></a> "
-                            f"<i class='bi bi-trash3 inline-run-btn text-danger cursor-pointer' style='cursor: pointer; font-size: 0.8rem;' title='Delete run' {onclick}></i>"
-                        )
-                    else:
-                        run["html_label"] = f"<i class='bi bi-x-octagon text-danger' title='{label}'>&nbsp;Error parsing URL</i>"
-                elif label:
-                    run["html_label"] = f"<span class='text-nowrap'>{label} <i class='bi bi-trash3 inline-run-btn text-danger cursor-pointer' style='cursor: pointer; font-size: 0.8rem;' title='Delete run' {onclick}></i></span>"
+                # Hardened (homelab fork): the label is outside input; build_run_label_html escapes it
+                html_label = build_run_label_html(run.get("label", ""), run.get("started_at", ""))
+                if html_label:
+                    run["html_label"] = html_label
 
         notify_web(
             instance=instance,
@@ -826,18 +816,18 @@ def setup_socket_handlers(
         failed = 0
         for url in urls:
             test_notification.add_url(url)
-            debug_me(f"Sending test notification to '{url}'")
+            debug_me(f"Sending test notification to '{describe_apprise_url(url)}'")
             url_success = test_notification.send_notification(notification_title, notification_message)
             success = success and url_success
             if url_success:
-                debug_me(f"📢 Test notification sent successfully to '{url}'")
-                update_log(instance, f"📢 Test notification sent successfully to '{url}'")
+                debug_me(f"📢 Test notification sent successfully to '{describe_apprise_url(url)}'")
+                update_log(instance, f"📢 Test notification sent successfully to '{describe_apprise_url(url)}'")
                 if len(urls) == 1:
                     update_status(instance, f"Test notification sent successfully", "success", False, False, "check2-circle")
             else:
                 failed += 1
-                debug_me(f"❌ Test notification failed to send to '{url}'.")
-                update_log(instance, f"❌ Test notification failed to send to '{url}'")
+                debug_me(f"❌ Test notification failed to send to '{describe_apprise_url(url)}'.")
+                update_log(instance, f"❌ Test notification failed to send to '{describe_apprise_url(url)}'")
                 if len(urls) == 1:
                     update_status(instance, f"Test notification failed to send", "danger", False, False, "x-circle")
             test_notification.clear_urls()
@@ -862,7 +852,7 @@ def setup_socket_handlers(
         auth_enabled = getattr(globals.config, "auth_enabled", False) or getattr(globals.config, "oidc_enabled", False)
         username = session.get("username", None)
         auth_type = session.get("auth_type", None)
-        debug_me(session)
+        debug_me(f"Session keys: {sorted(session.keys())}")
 
         notify_web(
             instance=instance,
@@ -892,7 +882,8 @@ def setup_socket_handlers(
                 password_change = not AuthenticationService.verify_password(password, globals.config.auth_password_hash)
 
             # Unpack the config dictionary into the local config
-            for key, value in data.get("config").items():
+            # Hardened (homelab fork): only real settings; never "path", the hash, or method names
+            for key, value in filter_client_config(data.get("config")).items():
                 new_config_dict[key] = value
 
             # Normalize the notification channels sent from the web UI into {"url", "events"} form
@@ -986,8 +977,8 @@ def setup_socket_handlers(
                 )
                 return
             
-            notify_web(instance, "save_config", {"saved": True, "config": vars(config)})
-            notify_web(instance, "update_ui", {"config": vars(config)})
+            notify_web(instance, "save_config", {"saved": True, "config": browser_config(config)})
+            notify_web(instance, "update_ui", {"config": browser_config(config)})
 
         except Exception as config_error:
             update_status(instance, str(config_error), color=StatusColor.WARNING.value)
@@ -1501,8 +1492,13 @@ def save_uploaded_file(
     temp_zip_folder = tempfile.mkdtemp()
     extract_dir = tempfile.mkdtemp()
     try:
-        # Move to a proper file location with correct filename for processing
-        temp_zip_path = os.path.join(temp_zip_folder, file_name)
+        # Move to a proper file location with correct filename for processing.
+        # Hardened (homelab fork): file_name comes from the browser; keep only its last component
+        # so an absolute or "../" name cannot move the upload anywhere outside temp_zip_folder.
+        zip_name = os.path.basename(str(file_name).replace("\\", "/")) or "upload.zip"
+        if zip_name in (".", ".."):
+            zip_name = "upload.zip"
+        temp_zip_path = safe_child_path(temp_zip_folder, zip_name.lstrip(".") or "upload.zip")
 
         shutil.move(temp_upload_path, temp_zip_path)
         debug_me(f"Moved {file_name} to temporary path: {temp_zip_folder}")

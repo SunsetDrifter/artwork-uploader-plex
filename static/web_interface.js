@@ -898,6 +898,19 @@ socket.on("add_spinner", (data) => {
     }
 });
 
+// Hardened (homelab fork): arguments for an inline onclick="fn(...)" handler. JSON-encode each
+// value so it stays one JS string, then escape for the double-quoted HTML attribute, because the
+// browser decodes the attribute before it parses the JavaScript.
+function jsCallArgs(...values) {
+    return values
+        .map((value) => JSON.stringify(value === undefined || value === null ? String(value) : String(value)))
+        .join(", ")
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+}
+
 // Update the status bar
 function updateStatus(message, color = "info", sticky = false, spinner = false, icon = false, width=null) {
     const statusEl = document.getElementById("status");
@@ -927,7 +940,8 @@ function updateStatus(message, color = "info", sticky = false, spinner = false, 
     }
     
     // Update the message and color
-    messageEl.innerHTML = message;
+    // Hardened (homelab fork): messages carry scraped titles and ZIP names; write them as text
+    messageEl.textContent = message;
 
     // If the passed color is not valid, default to 'info'
     const bootstrapColors = ['primary', 'secondary', 'success', 'danger', 'warning', 'info', 'light', 'dark'];
@@ -1015,7 +1029,8 @@ function updateLog(message, color = null) {
     // until the browser runs out of memory.
     const entry = document.createElement("div");
     entry.className = "log_message";
-    entry.innerHTML = message;
+    // Hardened (homelab fork): messages carry scraped titles and ZIP names; write them as text
+    entry.textContent = message;
     statusElement.prepend(entry);
 
     const MAX_LOG_LINES = 500;
@@ -2064,7 +2079,7 @@ function loadRunHistory() {
                 `<i class="bi bi-${typeIcon}" title="${typeLabel}"></i>`, // Type
                 run.html_label, // Label
                 `<i class="bi bi-${triggerIcon}" title="${triggerLabel}"></i>`, // Trigger
-                `<i class="bi bi-${outcome.icon} cursor-pointer inline-run-btn" style="cursor: pointer;" title="${outcome.text}" onclick="showLogsforRun('${logFileName}', '${run.label}')"></i>`, // Outcome
+                `<i class="bi bi-${outcome.icon} cursor-pointer inline-run-btn" style="cursor: pointer;" title="${outcome.text}" onclick="showLogsforRun(${jsCallArgs(logFileName, run.label)})"></i>`, // Outcome
                 `<span class="text-monospace">${run.assets_processed}</span>`, // Processed assets
                 `<span class="text-monospace">${run.success_count}</span>`, // Updated assets
                 `<span class="text-monospace">${run.cached_count}</span>`, // Cached assets
