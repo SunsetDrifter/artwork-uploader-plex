@@ -1,9 +1,31 @@
-import sys
+import threading
+
 import requests
 from bs4 import BeautifulSoup
-
 from core.exceptions import ScraperException
 from utils.utils import is_valid_url
+
+BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': 'Windows'
+}
+
+# One session per thread, so urllib3 keeps the connection alive between pages of the same host
+# and only the first page of a crawl pays for the TCP connection and the TLS handshake. A user
+# crawl walks many pages, and a bulk import walks many users. Per thread rather than one shared
+# session because requests.Session is documented as not thread safe, and a webhook import can
+# run alongside a bulk import. A crawl runs on one thread, so the reuse still covers it.
+_sessions = threading.local()
+
+
+def _session():
+    session = getattr(_sessions, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(BROWSER_HEADERS)
+        _sessions.session = session
+    return session
 
 
 # -------------------------------------------------
@@ -11,15 +33,9 @@ from utils.utils import is_valid_url
 # -------------------------------------------------
 
 def cook_soup(url):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': 'Windows'
-    }
-
     if is_valid_url(url):
         try:
-            response = requests.get(url, headers=headers, timeout=5)
+            response = _session().get(url, timeout=5)
             response.raise_for_status()
         except requests.exceptions.Timeout:
             raise ScraperException(f"Connection timed out (5 seconds) for URL: {url}")
@@ -35,9 +51,8 @@ def cook_soup(url):
         soup = BeautifulSoup(response.text, 'html.parser')
         return soup
 
-    else:
-        # Hardened (homelab fork): upstream had an `elif ".html" in url:` branch that
-        # did open(url) on a caller-supplied path -> arbitrary local file read as root.
-        # Removed; invalid URLs now fail closed.
-        raise ScraperException(f"Invalid or unsupported URL: {url}")
+    # Hardened (homelab fork): upstream has an `elif ".html" in url:` branch that
+    # does open(url) on a caller-supplied path -> arbitrary local file read as root.
+    # Removed; invalid URLs now fail closed.
+    raise ScraperException(f"Invalid or unsupported URL: {url}")
 

@@ -1,9 +1,4 @@
-import hashlib
-import json
-import re
-
-import validators
-
+import hashlib, json, re, validators
 from utils.notifications import debug_me
 from models.options import Options
 from models.url_item import URLItem
@@ -59,9 +54,10 @@ def title_cleaner(string):
 
     return title
 
-def elapsed_time(seconds: float) -> str:
+def elapsed_time(seconds: float, precise: bool = False) -> str:
     """ Converts seconds into 2h 31m 12s, 9m 34s or 32s format for readability"""
-    seconds = int(round(seconds))
+    seconds = int(round(seconds)) if not precise else round(seconds, 2)
+    
     if seconds < 60:
         return f"{seconds}s"
     
@@ -70,7 +66,9 @@ def elapsed_time(seconds: float) -> str:
 
     if h > 0:
         return f"{h}h {m}m {s}s"
-    return f"{m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 def parse_string_to_dict(input_string):
     # Remove unnecessary replacements
@@ -171,7 +169,7 @@ def parse_url_and_options(line):
     Each line could contain the URL and any options
     """
 
-    debug_me(f"Line: {line}", "parse_url_and_options")
+    debug_me(f"Line: {line}")
 
     year = None
     options = Options()
@@ -215,7 +213,7 @@ def parse_url_and_options(line):
                     year == None
                 options.year = year
             # If it's one of these flags it shouldn't have any arguments
-            elif flag in ["add-posters", "add-sets", "add-to-bulk", "force", "kometa", "stage", "temp"]:
+            elif flag in ["add-posters", "add-sets", "add-to-bulk", "force", "kometa", "stage", "temp", "skip-locked", "allow-artist-updates", "no-cache"]:
                 inv_flags.append(f"--{flag} has too many argumens")
             # If we ge to this point it's not a valid flag
             else:
@@ -224,7 +222,7 @@ def parse_url_and_options(line):
         else:
             if flag in ["filters", "exclude", "year"]:
                 inv_flags.append(f"--{flag} needs at least one argument")
-            elif flag not in ["add-posters", "add-sets" ,"add-to-bulk" ,"force", "kometa", "stage", "temp"]:
+            elif flag not in ["add-posters", "add-sets" ,"add-to-bulk" ,"force", "kometa", "stage", "temp", "skip-locked", "allow-artist-updates", "no-cache"]:
                 inv_flags.append(f"--{flag} is not a valid flag")
             else:
                 setattr(options, flag.replace("-","_"), True) # Convert add-posters into add_posters as the Options class expects
@@ -286,6 +284,9 @@ def get_path_parts(path: str) -> list:
     else:
         return PurePosixPath(path).parts
 
+def normalize_path(path:str) -> str:
+    return path.replace("\\", "/")
+
 def get_host_path(container_path: str) -> str:
     """
     Parses /proc/self/mountinfo to find the host path
@@ -306,6 +307,6 @@ def get_host_path(container_path: str) -> str:
                         return full_path
                     return host_path
     except Exception as e:
-        debug_me(f"Error reading /proc/self/mountinfo: {e}", "get_host_path")
+        debug_me(f"Error reading /proc/self/mountinfo: {e}")
     return "(not defined)"
 

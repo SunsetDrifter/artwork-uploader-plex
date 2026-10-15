@@ -10,44 +10,50 @@ The routes are organized into:
 - Helper functions for file uploads and processing
 """
 
-import os
-import logging
-import flask.cli
-import pprint
-import sys
-import re
-import base64
-import tempfile
-import zipfile
-import subprocess
-import time
-
+import os, logging, flask.cli, sys, re, base64, hmac, shutil, tempfile, zipfile, subprocess, threading, uuid, requests
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from packaging import version
 from plexapi.server import PlexServer
-
-from flask import render_template, send_from_directory, request, redirect, url_for, session
+from flask import render_template, send_from_directory, request, redirect, url_for, session, jsonify
+from requests_oauthlib import OAuth2Session
 from functools import wraps
-
 from core import globals
 from services.notify_service import NotifyService
-from utils import utils
+from utils.utils import calculate_file_md5, get_host_path
 from models.instance import Instance
-from core.config import Config
+from models.bulk_schedule import BulkSchedule
+from core.config import Config, normalize_notification_channels
+from core.enums import FileType, MediaType, ScraperSource, StatusColor, RunType, RunTrigger, RunOutcome, IntervalUnit, AuthType
+from core.exceptions import RunDeleteError, LogDeleteError
+from core.__version__ import __version__
 from processors.media_metadata import parse_title
-from utils.notifications import update_log, update_status, notify_web, debug_me
-from services import UtilityService, AuthenticationService
+from utils.notifications import update_log, update_status, notify_web, debug_me, log_to_file, resume_log_file
+from services import UtilityService, AuthenticationService, RunHistory
+from services.webhook_service import parse_event
+from core.constants import (
+    UPLOAD_CHUNK_SIZE,
+    UPLOAD_CHUNK_TIMEOUT,
+    WEBHOOK_TOKEN_HEADER,
+    URL_SOURCE_MAP,
+    URL_TYPE_MAP,
+    DEFAULT_LOG_PATH,
+    OIDC_REQUEST_TIMEOUT
+)
 
+def authentication_required():
+    """Whether the config asks for a login. Read from globals so the HTTP routes and the socket
+       handlers answer from one place, and so a config reload is picked up by both."""
+    config = globals.config if hasattr(globals, 'config') and globals.config else None
+    if not config:
+        return False
+    return config.auth_enabled or config.oidc_enabled
 
 def login_required(f):
     """Decorator to require authentication for routes."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        # Get config from globals
-        config = globals.config if hasattr(globals, 'config') and globals.config else None
-
-        # If auth not enabled, allow access
-        if not config or not config.auth_enabled:
+        if not authentication_required():
             return f(*args, **kwargs)
 
         # Check if user is logged in
@@ -57,6 +63,12 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def get_oidc_redirect_uri(config):
+    if config.external_url:
+        base_url = config.external_url.rstrip("/")
+        return f"{base_url}/login/oidc/callback"
+    
+    return url_for("oidc_callback", _external=True)
 
 def setup_routes(web_app, config: Config):
     """
@@ -66,41 +78,210 @@ def setup_routes(web_app, config: Config):
         web_app: Flask application instance
         config: Configuration object
     """
+
+    @web_app.route("/api/health", methods=["GET"])
+    def health_report():
+        """Public healthcheck endpoint"""
+        return jsonify({
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "version": __version__
+        })
+    
+    @web_app.route("/api/auth/status", methods=["GET"])
+    def auth_status():
+        """Public endpoint to check which authentication methods are enabled."""
+        return jsonify({
+            "basic_enabled": getattr(config, "auth_enabled", False),
+            "oidc_enabled": getattr(config, "oidc_enabled", False),
+            "oidc_label": getattr(config, "oidc_label", "OIDC"),
+            "version": __version__
+        })
+
     @web_app.route("/login", methods=["GET", "POST"])
     def login():
         """Handle user login."""
+
         # If auth not enabled, redirect to home
-        if not config.auth_enabled:
+        if not config.auth_enabled and not config.oidc_enabled:
+            debug_me("Auth is disabled, redirecting to the app")
             return redirect(url_for('home'))
 
         # Already logged in
         if session.get('authenticated'):
+            debug_me(f"User {session.get('username')} is already authenticated, redirecting to the app")
             return redirect(url_for('home'))
+
+        if request.method == "GET":
+            error = session.pop("oidc_error", None)
+            return render_template("login.html", error=error)
 
         error = None
 
         if request.method == "POST":
-            username = request.form.get('username', '')
-            password = request.form.get('password', '')
-            remember = request.form.get('remember') == 'on'
 
-            # Authenticate
-            if AuthenticationService.authenticate(username, password, config.auth_username, config.auth_password_hash):
-                session['authenticated'] = True
-                session.permanent = remember  # Set to 7 days if remember is checked
-                update_log(Instance(broadcast=True), f"👤 User {username} logged in successfully")
-                return redirect(url_for('home'))
-            else:
-                error = "Invalid username or password"
-                update_log(Instance(broadcast=True), f"⛔ Invalid username or password provided")
+            oidc_login = request.form.get("oidc-login", None)
+            basic_Login = request.form.get('username', None)
+
+            if basic_Login:
+                debug_me(f"Logging in with basic authentication")
+
+                username = request.form.get('username', '')
+                password = request.form.get('password', '')
+                remember = request.form.get('remember') == 'on'
+
+                # Authenticate
+                if AuthenticationService.authenticate(username, password, config.auth_username, config.auth_password_hash):
+                    session['authenticated'] = True
+                    session['auth_type'] = AuthType.BASIC.value
+                    session['username'] = username
+                    session.permanent = remember  # Set to 7 days if remember is checked
+                    update_log(Instance(broadcast=True), f"👤 User {username} logged in successfully")
+                    return redirect(url_for('home'))
+                else:
+                    error = "Invalid username or password"
+                    update_log(Instance(broadcast=True), f"⛔ Invalid username or password provided")
+
+            elif oidc_login:
+                debug_me(f"Logging in with OIDC")
+                scopes = config.oidc_scopes
+                if "openid" not in scopes:
+                    scopes.append("openid")
+
+                redirect_uri = get_oidc_redirect_uri(config)
+
+                oauth = OAuth2Session(
+                    client_id=config.oidc_client_id,
+                    redirect_uri=redirect_uri,
+                    scope=scopes
+                )
+
+                discovery_url = f"{config.oidc_issuer.rstrip('/')}/.well-known/openid-configuration"
+                try:
+                    disc_res = oauth.get(discovery_url, timeout=OIDC_REQUEST_TIMEOUT)
+                    authorization_endpoint = disc_res.json()["authorization_endpoint"]
+                except Exception as e:
+                    debug_me(f"OIDC Discovery Error: {e}")
+                    return render_template("login.html", error="Could not reach OIDC provider.")
+
+                authorization_url, state = oauth.authorization_url(authorization_endpoint)
+                
+                # Store OAuth state in session for CSRF validation during callback
+                session["oauth_state"] = state
+                session["auth_type"] = AuthType.OIDC.value
+                return redirect(authorization_url)
 
         return render_template("login.html", error=error)
 
+    @web_app.route("/login/oidc/callback", methods=["GET"])
+    def oidc_callback():
+
+        state = session.pop("oauth_state", None)
+        if not state or state != request.args.get("state"):
+            return render_template("login.html", error="Invalid OIDC state session parameter.")
+
+        redirect_uri = get_oidc_redirect_uri(config)
+        debug_me(f"Obtained redirect URI as {redirect_uri}")
+
+        scopes = config.oidc_scopes
+
+        oauth = OAuth2Session(
+            client_id=config.oidc_client_id,
+            state=state,
+            redirect_uri=redirect_uri,
+            scope=scopes
+        )
+
+        try:
+            discovery_url = f"{config.oidc_issuer.rstrip('/')}/.well-known/openid-configuration"
+            disc_res = oauth.get(discovery_url, timeout=OIDC_REQUEST_TIMEOUT).json()
+            token_endpoint = disc_res["token_endpoint"]
+            userinfo_endpoint = disc_res.get("userinfo_endpoint")
+            end_session_endpoint = disc_res.get("end_session_endpoint")
+
+            query_str = request.query_string.decode("utf-8")
+            auth_response_url = f"{redirect_uri}?{query_str}" if query_str else redirect_uri
+            debug_me(f"Constructing auth response URL as {auth_response_url}")
+            oauth.fetch_token(
+                token_url=token_endpoint,
+                authorization_response=auth_response_url,
+                client_secret=config.oidc_client_secret,
+                timeout=OIDC_REQUEST_TIMEOUT
+            )
+
+            # Retrieve user information
+            user_info = oauth.get(userinfo_endpoint, timeout=OIDC_REQUEST_TIMEOUT).json() if userinfo_endpoint else {}
+
+            username = user_info.get("preferred_username") or user_info.get("sub") or "OIDC User"
+            groups_claim = config.oidc_groups_claim or "groups"
+            user_groups = user_info.get(groups_claim, [])
+
+            token_data = oauth.token
+            if "id_token" in token_data:
+                session["id_token"] = token_data["id_token"]
+            
+            # Validate allowed groups if configured
+            if config.oidc_allowed_groups:
+                allowed_set = set(config.oidc_allowed_groups)
+                user_set = set(user_groups) if isinstance(user_groups, list) else {user_groups}
+                
+                if not allowed_set.intersection(user_set):
+                    update_log(Instance(broadcast=True), f"⛔ OIDC login denied for {username}: Missing required group permissions")
+                    session.clear()
+                    session["oidc_error"] = "Access Denied: Your account does not belong to an allowed group."
+                    if end_session_endpoint:
+                        post_logout_uri = f"{redirect_uri.rsplit('/', 3)[0]}/login"
+                        id_token = token_data.get("id_token")
+                        logout_url = (
+                            f"{end_session_endpoint}?"
+                            f"post_logout_redirect_uri={post_logout_uri}&"
+                            f"client_id={config.oidc_client_id}"
+                        )
+                        if id_token:
+                            logout_url += f"&id_token_hint={id_token}"
+                        return redirect(logout_url)                        
+
+                    return render_template("login.html", error="Access Denied: You do not belong to an allowed group.")
+
+            # Authenticate session
+            session["authenticated"] = True
+            session["username"] = username
+            update_log(Instance(broadcast=True), f"👤 User {username} logged in successfully via OIDC")
+            return redirect(url_for("home"))
+
+        except Exception as e:
+            debug_me(f"OIDC Callback Error: {e}")
+            return render_template("login.html", error=f"OIDC authentication failed: {e}.")
+        
     @web_app.route("/logout")
     def logout():
         """Handle user logout."""
-        update_log(Instance(broadcast=True), f"👋🏻 Logout successful")
+        id_token = session.get("id_token")
+        auth_type = session.pop("auth_type", None)
         session.clear()
+        update_log(Instance(broadcast=True), f"👋🏻 Logout successful")
+
+        if config.oidc_enabled and config.oidc_issuer and auth_type == AuthType.OIDC.value:
+            post_logout_uri = f"{get_oidc_redirect_uri(config).rsplit('/', 3)[0]}/login"
+            try:
+                discovery_url = f"{config.oidc_issuer.rstrip('/')}/.well-known/openid-configuration"
+
+                disc_res = requests.get(discovery_url, timeout=OIDC_REQUEST_TIMEOUT).json()
+                end_session_endpoint = disc_res.get("end_session_endpoint")
+                
+                if end_session_endpoint:
+                    logout_url = (
+                       f"{end_session_endpoint}?"
+                        f"post_logout_redirect_uri={post_logout_uri}&"
+                        f"client_id={config.oidc_client_id}"
+                    )
+                    if id_token:
+                        logout_url += f"&id_token_hint={id_token}"
+                    return redirect(logout_url)
+                    
+            except Exception as e:
+                debug_me(f"Error fetching OIDC end_session_endpoint: {e}")
+
         return redirect(url_for('login'))
 
     @web_app.route("/")
@@ -123,6 +304,86 @@ def setup_routes(web_app, config: Config):
         uploads_path = os.path.join(UtilityService.get_exe_dir(), 'uploads')
         return send_from_directory(uploads_path, filename)
 
+    @web_app.route('/api/browse', methods=['GET'])
+    @login_required
+    def browse_directory():
+        req_path = request.args.get('path', '').strip()
+
+        if not req_path and os.name == 'nt':
+            import string, ctypes
+            drives = []
+            try:
+                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+                for letter in string.ascii_uppercase:
+                    if bitmask & 1:
+                        drives.append({"name": f"Drive {letter}:", "path": f"{letter}:\\"})
+                    bitmask >>= 1
+            except Exception:
+                pass
+            return jsonify({"current_path": req_path, "folders": drives})
+
+        abs_path = os.path.abspath(req_path)
+        
+        if not os.path.exists(abs_path) or not os.path.isdir(abs_path):
+            abs_path = os.path.abspath('.')
+
+        folders = []
+        try:
+            for entry in os.scandir(abs_path):
+                if entry.is_dir() and not entry.name.startswith('.'):
+                    folders.append({
+                        "name": entry.name,
+                        "path": entry.path
+                    })
+            folders.sort(key=lambda x: x['name'].lower())
+        except PermissionError:
+            pass
+
+        return jsonify({
+            "current_path": abs_path,
+            "folders": folders
+        })
+
+    def webhook_token_ok():
+        """A webhook request is authorised when it carries the configured token, sent as the
+           X-Webhook-Token header, the HTTP Basic password, or a ?token= query parameter."""
+        token = globals.config.webhook_token
+        if not token:
+            return False
+        provided = (request.headers.get(WEBHOOK_TOKEN_HEADER)
+                    or (request.authorization.password if request.authorization else None)
+                    or request.args.get("token") or "")
+        return hmac.compare_digest(provided, token)
+
+    @web_app.route("/webhook/radarr", methods=["POST"])
+    @web_app.route("/webhook/sonarr", methods=["POST"])
+    def arr_webhook():
+        """Receive a Sonarr/Radarr import event and apply the cached artwork for it. Disabled
+           by default (404), so the endpoint is indistinguishable from upstream when off."""
+        if not globals.config.enable_webhooks:
+            return {"status": "not found"}, 404
+        if not webhook_token_ok():
+            update_log(Instance(broadcast=True), "⛔ Webhook request rejected (missing or invalid token)")
+            return {"status": "unauthorized"}, 401
+        payload = request.get_json(silent=True)
+        if payload is None:
+            return {"status": "invalid json"}, 400
+        event = parse_event(payload)
+        if event == "test":
+            update_log(Instance(broadcast=True), "🧪 Webhook test received")
+            return {"status": "test ok"}, 200
+        if event is None:
+            return {"status": "ignored"}, 200
+        if globals.plex is None or not globals.plex.has_libraries():
+            update_log(Instance(broadcast=True), "⛔ Webhook received but Plex libraries are not configured")
+            return {"status": "plex not configured"}, 503
+        if not globals.config.webhook_tpdb_users:
+            update_log(Instance(broadcast=True), "📥 Webhook received but no ThePosterDB users are configured (webhook_tpdb_users)")
+            return {"status": "no users configured"}, 200
+        update_log(Instance(broadcast=True), "📥 Webhook received and queued for processing")
+        globals.webhook_service.enqueue(event)
+        return {"status": "queued"}, 200
+
 
 def setup_socket_handlers(
     config: Config,
@@ -142,6 +403,7 @@ def setup_socket_handlers(
     # Import functions from artwork_uploader (to avoid circular imports at module level)
     from artwork_uploader import (
         process_scrape_url_from_web,
+        request_scrape_stop,
         run_bulk_import_scrape_in_thread,
         save_bulk_import_file,
         load_bulk_import_file,
@@ -158,35 +420,46 @@ def setup_socket_handlers(
     # Temporary storage for chunked uploads
     upload_chunks = {}
 
+    @globals.web_socket.on("connect")
+    def handle_connect():
+        """Refuse the connection when a login is configured and this session has not logged in.
+
+           The web UI does its real work over the socket, so guarding the HTTP routes alone
+           leaves every handler below reachable without a session. Rejecting at connect covers
+           all of them, including any added later. The login page loads no socket, so nothing
+           needs a connection before a session exists."""
+        if authentication_required() and not session.get('authenticated'):
+            debug_me("Refused a Socket.IO connection from a session that has not logged in")
+            return False
+
     @globals.web_socket.on("debug_mode")
     def debug_mode(data):
         """Report on debug mode status and toggle debug mode."""
         instance = Instance(data.get("instance_id"), "web")
         if data.get("action") == "get":
             update_log(instance, f"🐞 Debug mode is {'On' if globals.debug else 'Off'}")
-            debug_me(f"Reporting current debug mode: {'On' if globals.debug else 'Off'}", "debug_mode")
+            debug_me(f"Reporting current debug mode: {'On' if globals.debug else 'Off'}")
             notify_web(instance, "debug_mode", { "debug": globals.debug })
         elif data.get("action") == "toggle":
             update_log(instance, f"🐞 Debug mode is {'Off' if globals.debug else 'On'}")
-            debug_me(f"Turning debug mode {'Off' if globals.debug else 'On'}", "debug_mode")
+            debug_me(f"Turning debug mode {'Off' if globals.debug else 'On'}")
             notify_web(instance, "debug_mode", { "debug": not globals.debug })
-            if globals.debug:
-                globals.debug = False
-            else:
-                globals.debug = True
+            globals.debug = not globals.debug
 
     @globals.web_socket.on("check_for_update")
     def check_for_update(data):
         """Check for updates when requested by the frontend."""
-        instance = Instance(data.get("instance_id"), "web", broadcast=True)
-        debug_me(f"Checking for update by request from the frontend", "check_for_update")
+        instance = Instance(data.get("instance_id"), "web")
+        debug_me(f"Checking for update by request from the frontend")
         latest_version = get_latest_version()
         if latest_version and version.parse(latest_version.lstrip('v')) > version.parse(current_version.lstrip('v')):
             update_log(instance, f"🚨 Update available: {latest_version} (current: {current_version})")
-            notify_web(instance, "version_check", { "new_version": latest_version, "current_version": current_version, "docker": "true" if globals.docker else "false" })
+            instance.broadcast = True
+            notify_web(instance, "version_check", { "new_version": latest_version, "current_version": current_version, "docker": globals.docker })
         else:
             update_log(instance, f"🏷️ You are running the latest version: {current_version}")
-            notify_web(instance, "version_check", { "new_version": None, "current_version": current_version, "docker": "true" if globals.docker else "false" })
+            instance.broadcast = True
+            notify_web(instance, "version_check", { "new_version": None, "current_version": current_version, "docker": globals.docker })
 
     @globals.web_socket.on("update_app")
     def update_app(data):
@@ -212,7 +485,7 @@ def setup_socket_handlers(
     @globals.web_socket.on("start_scrape")
     def handle_scrape_from_web(data):
         """Handle scraping request from web UI."""
-        instance = Instance(data.get("instance_id"), "web")
+        instance = Instance(data.get("instance_id"), "web", broadcast=True)
         url = data.get("url").lower()
         options = data.get("options")
         filters = data.get("filters")
@@ -225,21 +498,23 @@ def setup_socket_handlers(
                 url = url + " " + " ".join(options)
             if filters and len(filters) < 6:
                 url = url + " --filters " + " ".join(filters)
-            notify_web(
-                instance,
-                "element_disable",
-                { "element": ["scrape_url", "scrape_button", "bulk_button"], "mode": True }
-            )
-            notify_web(instance, "add_spinner", { "element": "scrape_button", "mode": True })
             process_scrape_url_from_web(instance, url)
+
+    @globals.web_socket.on("stop_scrape")
+    def handle_stop_scrape(data):
+        """Flag any in-flight scrape to stop cleanly (user pressed Stop in the web UI)."""
+        instance = Instance(data.get("instance_id"), "web", broadcast=True)
+        if not request_scrape_stop():
+            update_log(instance, "ℹ️ Nothing to stop - no scrape is running")
 
     @globals.web_socket.on("start_bulk_import")
     def handle_bulk_import_from_web(data):
         """Handle bulk import request from web UI."""
-        instance = Instance(data.get("instance_id"), "web")
+        instance = Instance(data.get("instance_id"), "web", broadcast=True)
         bulk_list = data.get("bulk_list").lower()
         filename = data.get("filename", "bulk_import.txt")
-        run_bulk_import_scrape_in_thread(instance, bulk_list, filename)
+        notify = data.get("notify", False)
+        run_bulk_import_scrape_in_thread(instance, bulk_list, filename, notify=notify)
 
     @globals.web_socket.on("save_bulk_import")
     def handle_bulk_import(data):
@@ -269,8 +544,155 @@ def setup_socket_handlers(
             folder_path = Path("bulk_imports")
             bulk_files = [f.name for f in folder_path.iterdir() if f.is_file()]
         except (FileNotFoundError, PermissionError) as e:
-            debug_me(f"Error loading bulk import file list: {e}", "load_bulk_filelist")
+            debug_me(f"Error loading bulk import file list: {e}")
         notify_web(instance, "load_bulk_filelist", {"bulk_files": bulk_files})
+
+    @globals.web_socket.on("get_log_file")
+    def get_log_file(data):
+        """Get the contents of a log file and send them back to the frontend"""
+        instance = Instance(data.get("instance_id"), "web")
+        log_file_name = data.get("log_file_name")
+        full_path = os.path.join(DEFAULT_LOG_PATH, log_file_name)
+        log_file_contents = ""
+        error = ""
+
+        try:
+            with open(full_path, "r", encoding="utf-8") as log_file:
+                log_file_contents = log_file.read()
+            debug_me(f"Successfully obtained contents of log file '{log_file_name}'")
+        except OSError as e:
+            debug_me(f"Unable to read contents of log file '{log_file_name}': {e.strerror}")
+            error = e.strerror
+
+        notify_web(
+            instance=instance,
+            event="get_log_file",
+            data_to_include={
+                "success": True if log_file_contents else False,
+                "contents": log_file_contents,
+                "error": error
+            },
+            silent=True
+        )
+
+    @globals.web_socket.on("clear_history")
+    def clear_run_history(data):
+        """Clears the entire Run History"""
+        instance = Instance(data.get("instance_id"), "web", broadcast=True)
+        run_type = data.get("run_type")
+        deleted_runs = 0
+        failed_logs = []
+        result = "unknown"
+
+        runs = RunHistory().get_runs(run_type=run_type)
+
+        for run in runs:
+            try:
+                timestamp = run.get("started_at")
+                if timestamp:
+                    RunHistory().delete_run(timestamp, refresh_frontend=False)
+                    deleted_runs += 1
+
+            except RunDeleteError as e:
+                debug_me(f"Unable to delete run '{e.run_label}': {str(e)}")
+            except LogDeleteError as e:
+                deleted_runs += 1
+                failed_logs.append({
+                    "file_name": e.log_file,
+                    "reason": str(e)
+                })
+                debug_me(f"Error deleting log file '{e.log_file}' for run '{e.run_label}': {str(e)}")
+            except Exception as e:
+                debug_me(f"Generic error deleting run: {str(e)}")
+
+        if deleted_runs == len(runs):
+            result = "success"
+        elif deleted_runs == 0:
+            result = "failed"
+        elif deleted_runs < len(runs):
+            result = "partial"
+
+        notify_web(
+            instance=instance,
+            event="history_cleared",
+            data_to_include={
+                "result": result,
+                "deleted": deleted_runs,
+                "total": len(runs),
+                "remaining_logs": failed_logs
+            }
+        )
+
+    @globals.web_socket.on("delete_run")
+    def delete_run(data):
+        """Deletes a single run from the run history"""
+        instance = Instance(data.get("instance_id"), "web", broadcast=True)
+        timestamp = data.get("timestamp", None)
+        result = "success"
+
+        if timestamp:
+            try:
+                RunHistory().delete_run(timestamp)
+                message = "Successfully deleted run"
+
+            except LogDeleteError as e:
+                result = "warning"
+                message = f"Run '{e.run_label}' deleted, but could not delete log file '{e.log_file}' ({str(e)})"
+
+            except RunDeleteError as e:
+                result = "error"
+                message = f"Unable to delete run '{e.run_label}' ({str(e)})"
+
+            notify_web(
+                instance=instance,
+                event="run_deleted",
+                data_to_include={ "result": result, "message": message }
+            )
+
+    @globals.web_socket.on("load_run_history")
+    def load_run_history(data):
+        """Load recent run history, optionally narrowed to one run type."""
+        instance = Instance(data.get("instance_id"), "web", broadcast=True)
+        run_type = data.get("run_type") or None
+        if run_type not in RunType:
+            run_type = None
+        runs = []
+        all_runs = RunHistory().get_runs()
+        for run in all_runs:
+            if not run_type or run_type and run.get("run_type") == run_type:
+                runs.append(run)
+                label = run.get("label", "")
+                timestamp = run.get("started_at", "")
+                onclick = f"""onclick="deleteRun('{timestamp}', '{label}')" """
+                if label and "https" in label:
+                    clean_url = label.replace("https://", "").strip()
+                    parts = [p for p in clean_url.split("/") if p]
+                    if len(parts) >= 3:
+                        domain, asset_type, id = parts[0], parts[1], parts[2]
+                        source = URL_SOURCE_MAP.get(domain, "Unknown")
+                        type = URL_TYPE_MAP.get(asset_type, { "icon": "question-circle", "label": "Unknown URL type" })
+                        run["html_label"] = (
+                            f"<a href='{label}' target='_blank' rel='noopener noreferrer' "
+                            f"class='text-decoration-none text-reset' title='{label}'>{source} "
+                            f"<i class='bi bi-{type.get('icon', 'question-circle')}' title='{type.get('label', 'Unknown URL type')}'></i> "
+                            f"<span class='input-monospace' style='font-size: 0.8rem;'>{id}</span></a> "
+                            f"<i class='bi bi-trash3 inline-run-btn text-danger cursor-pointer' style='cursor: pointer; font-size: 0.8rem;' title='Delete run' {onclick}></i>"
+                        )
+                    else:
+                        run["html_label"] = f"<i class='bi bi-x-octagon text-danger' title='{label}'>&nbsp;Error parsing URL</i>"
+                elif label:
+                    run["html_label"] = f"<span class='text-nowrap'>{label} <i class='bi bi-trash3 inline-run-btn text-danger cursor-pointer' style='cursor: pointer; font-size: 0.8rem;' title='Delete run' {onclick}></i></span>"
+
+        notify_web(
+            instance=instance,
+            event="load_run_history",
+            data_to_include={
+                "runs": runs,
+                "run_type": run_type or "all",
+                "total": len(all_runs)
+            },
+            silent=True
+        )
 
     @globals.web_socket.on("load_bulk_import")
     def load_bulk_import(data):
@@ -280,28 +702,48 @@ def setup_socket_handlers(
 
     @globals.web_socket.on("rename_bulk_file")
     def rename_bulk_file(data):
-        """Rename a bulk import file."""
+        """Rename a bulk import file, taking any of its schedules along with it."""
         instance = Instance(data.get("instance_id"), "web")
         old_name = data.get("old_filename")
         new_name = data.get("new_filename")
-        time = globals.scheduler_service.run_times_by_file.get(old_name)
-        rename_bulk_import_file(instance, old_name, new_name)
-        if time:
-            delete_task_from_scheduler({"instance_id": instance.id, "file": old_name})
-            add_tasks_to_scheduler({"instance_id": instance.id, "file": new_name, "time": time})
+        if not rename_bulk_import_file(instance, old_name, new_name):
+            # The file on disk still has its old name; repointing the schedules
+            # would leave every one of them targeting a file that does not exist.
+            return
+
+        renamed_ids = globals.scheduler_service.rename_file(old_name, new_name)
+        if renamed_ids:
+            config.load()
+            for each_schedule in config.schedules:
+                if each_schedule.get("id") in renamed_ids:
+                    each_schedule["file"] = new_name
+            config.save()
 
     @globals.web_socket.on("delete_bulk_file")
     def delete_bulk_file(data):
-        """Delete a bulk import file."""
+        """Delete a bulk import file, and every schedule that points at it."""
         instance = Instance(data.get("instance_id"), "web")
-        delete_bulk_import_file(instance, data.get("filename"))
+        filename = data.get("filename")
+        if not delete_bulk_import_file(instance, filename):
+            return
+
+        # The server owns this cleanup: a client's in-memory schedule list can be
+        # stale, and an orphaned schedule fires forever against a missing file.
+        for job_id in globals.scheduler_service.get_jobs_for_file(filename):
+            globals.scheduler_service.remove_schedule(job_id)
+        config.load()
+        remaining = [s for s in config.schedules if s.get("file") != filename]
+        if len(remaining) != len(config.schedules):
+            removed = len(config.schedules) - len(remaining)
+            config.schedules = remaining
+            config.save()
+            update_log(instance, f"🗑️ Removed {removed} schedule(s) for '{filename}'")
 
     @globals.web_socket.on("create_bulk_file")
     def create_bulk_file(data):
         """Create a new bulk import file."""
         instance = Instance(data.get("instance_id"), "web")
 
-        from datetime import datetime
         timestamp = datetime.now().strftime("%d %b %Y %H:%M:%S")
 
         # Generate a unique filename
@@ -334,104 +776,48 @@ def setup_socket_handlers(
     @globals.web_socket.on("display_message")
     def display_message(data):
         """Log a debug message from the frontend."""
-        instance = Instance(data.get("instance_id"), "web")
-        debug_me(f"Received message from fronted: '{data.get('message')}' • Log level: '{data.get('level')}'", "display_message")
+        instance = Instance(data.get("instance_id"), "web", broadcast=data.get("broadcast", False))
+        debug_me(f"Received message from fronted: '{data.get('message')}' • Log level: '{data.get('level')}'")
         if data.get("level") == "debug":
             debug_me(data.get("message"), data.get("title", "web_message"))
         elif data.get("level") == "log":
             update_log(instance, data.get("message"))
+        elif data.get("level") == "status":
+            update_status(instance, data.get("message"), data.get("color", "primary"), data.get("sticky", False), data.get("spinner", False), data.get("icon", None))
 
-    @globals.web_socket.on("test_plex_connect")
-    def test_plex_connect(data):
-        """Test connectivity to Plex server"""
+    @globals.web_socket.on("get_plex_libraries")
+    def get_plex_libraries(data):
+        """Get a list of the available Plex libraries"""
 
-        def fail(status, log):
-            if saving_config:
-                log = f"Configuration not saved ({log})"
-                status = f"Configuration not saved ({status})"
-            update_log(instance, log)
-            update_status(instance, status, "danger", False, False, "x-circle")
-            notify_web(instance, "test_plex_connect", { "success": False })
-            notify_web(instance, "element_disable", { "element": ["test_plex_btn"], "mode": False })
+        instance = Instance(data.get("instance_id", "web"))
 
-        instance = Instance(data.get("instance_id"), "web")
-        instance.broadcast = True
-        update_status(instance, "Testing connection to Plex server", "info", True, True)
-
-        # Disable the test button to prevent multiple clicks
-        notify_web(instance, "element_disable", {"element": ["test_plex_btn"], "mode": True})
-        
-        # Capture Plex settings form parameters
         url = data.get("url", "")
-        debug_me(f"Obtained Plex URL: {url}", "test_plex_connect")
         token = data.get("token", "")
-        # Hardened (homelab fork): never log the raw Plex token (was logged in full
-        # when debug mode was on, persisting to the rotating log on disk).
-        debug_me(f"Obtained Plex token: {'[redacted, %d chars]' % len(token) if token else '[empty]'}", "test_plex_connect")
-        tv_libs = data.get("tv_libs", "")
-        debug_me(f"Obtained {len(tv_libs)} TV libraries: {tv_libs}", "test_plex_connect")
-        movie_libs = data.get("movie_libs", "")
-        debug_me(f"Obtained {len(movie_libs)} Movie libraries: {movie_libs}", "test_plex_connect")
-        saving_config = data.get("saving_config")
-        if saving_config:
-            debug_me(f"Testing Plex connectivity before saving configuration", "test_plex_connect")
-        else:
-            debug_me(f"Testing Plex connectivity", "test_plex_connect")
-        
-        # Check for a valid Plex server URL and token
-        url_pattern = r"^https?:\/\/([a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*|(\d{1,3}(\.\d{1,3}){3}))(:\d+)?(\/.*)?$"
-        token_pattern = r"^[A-Za-z0-9_-]{20,}$"
-        if not re.fullmatch(url_pattern, url):
-            fail("Invalid Plex URL", f"❌ Invalid Plex URL")
-            return
-        if not re.fullmatch(token_pattern, token):
-            fail("Invalid Plex token", f"❌ Invalid Plex token")
-            return
-        
-        # Check connectivity to server
+
         try:
-            plex_server = PlexServer(url, token, timeout=5)
+            plex_server = PlexServer(url, token, timeout=globals.config.plex_connect_timeout)
+            debug_me(f"Successfully connected to Plex server at '{url}'")
         except Exception as e:
-            if "NewConnectionError" in str(e):
-                log = f"❌ Error connecting to Plex (Connection refused)"
-            elif "ConnectTimeoutError" in str(e) or "timed out" in str(e):
-                log = f"❌ Error connecting to Plex (Timed out)"
-            elif "unauthorized" in str(e):
-                log = f"❌ Error connecting to Plex (Invalid token)"
-            elif "NameResolutionError" in str(e):
-                log = f"❌ Error connecting to Plex (Cannot resolve server name)"
-            elif "SSLError" in str(e):
-                log = f"❌ Error connecting to Plex (SSL certificate validation failed)"
-            else:
-                log = f"❌ Unknown error connecting to Plex: {str(e)}"
-            fail ("Error connecting to Plex, check log for details", log)
-            debug_me(f"Error connecting to Plex: {str(e)}", "test_plex_connect")
+            debug_me(f"Failed to connect to Plex server at '{url}'")
+            notify_web(instance, f"get_plex_libraries", { "tv_libraries": [], "movie_libraries": [], "message": "Unable to connect to Plex" })
             return
 
-        # Check that the provided libraries exist in the server        
-        all_libs = list(tv_libs) + list(movie_libs)
-        invalid_libs = []
-        for lib in all_libs:
-            try:
-                plex_server.library.section(lib)
-            except Exception:
-                invalid_libs.append(lib)
-        if invalid_libs:
-            fail("Some libraries not found, check log for details.", f"❌ The following libraries could not be found: {", ".join (invalid_libs)}")
-            return
-        
-        update_log(instance, "✅ Successfully connected to Plex server")
-        update_status(instance, "Successfully connected to Plex server", "success", False, False, "check2-circle")
-        notify_web(instance, "element_disable", { "element": ["test_plex_btn"], "mode": False })
-        notify_web(instance, "test_plex_connect", { "success": True })
+        try:
+            all_libraries = plex_server.library.sections()
+            tv_libs = [lib.title for lib in all_libraries if lib.type == "show"]
+            movie_libs = [lib.title for lib in all_libraries if lib.type == "movie"]
+            debug_me(f"Obtained tv_libraries: {tv_libs}")
+            debug_me(f"Obtained movie_libraries: {movie_libs}")
+            notify_web(instance, "get_plex_libraries", { "tv_libraries": tv_libs, "movie_libraries": movie_libs })
+        except AttributeError as e:
+            notify_web(instance, f"get_plex_libraries", { "tv_libraries": [], "movie_libraries": [], "message": "Unable to connect to Plex" })
 
     @globals.web_socket.on("test_notifications")
     def test_notifications(data):
         """Send a test notification."""
         instance = Instance(data.get("instance_id"), "web")
-        instance.broadcast = True
         # Disable the test button to prevent multiple clicks
-        notify_web(instance, "element_disable", {"element": ["test_notif_btn"], "mode": True})
+        notify_web(instance, "add_spinner", { "element": "test_notif_btn", "mode": True })
         urls = data.get("urls", [])
         notification_title = "Test Notification from Artwork Uploader"
         notification_message = "This is a test notification to verify your notification settings are working correctly."
@@ -440,35 +826,53 @@ def setup_socket_handlers(
         failed = 0
         for url in urls:
             test_notification.add_url(url)
-            debug_me(f"Sending test notification to '{url}'", "test_notifications")
+            debug_me(f"Sending test notification to '{url}'")
             url_success = test_notification.send_notification(notification_title, notification_message)
             success = success and url_success
             if url_success:
-                debug_me(f"📢 Test notification sent successfully to '{url}'", "test_notifications")
+                debug_me(f"📢 Test notification sent successfully to '{url}'")
                 update_log(instance, f"📢 Test notification sent successfully to '{url}'")
                 if len(urls) == 1:
                     update_status(instance, f"Test notification sent successfully", "success", False, False, "check2-circle")
             else:
                 failed += 1
-                debug_me(f"❌ Test notification failed to send to '{url}'.", "test_notifications")
+                debug_me(f"❌ Test notification failed to send to '{url}'.")
                 update_log(instance, f"❌ Test notification failed to send to '{url}'")
                 if len(urls) == 1:
                     update_status(instance, f"Test notification failed to send", "danger", False, False, "x-circle")
             test_notification.clear_urls()
         if len(urls) > 1:
             if success and len(urls) > 1:
-                debug_me("All test notifications sent successfully", "test_notifications")
+                debug_me("All test notifications sent successfully")
                 update_log(instance, "✅ All test notifications sent successfully")
                 update_status(instance, "All test notifications sent successfully", "success", False, False, "check2-circle")
             elif failed < len(urls):
-                debug_me("Some test notifications failed to send", "test_notifications")
+                debug_me("Some test notifications failed to send")
                 update_log(instance, "⚠️ Some test notifications failed to send")
                 update_status(instance, "Some test notifications failed to send. Check logs for details.", "warning", False, False, "exclamation-triangle")
             else:
-                debug_me("All test notifications failed to send", "test_notifications")
+                debug_me("All test notifications failed to send")
                 update_log(instance, "❌ All test notifications failed to send")
                 update_status(instance, "All test notifications failed to send", "danger", False, False, "x-circle")
-        notify_web(instance, "element_disable", { "element": ["test_notif_btn"], "mode": False })
+        notify_web(instance, "add_spinner", { "element": "test_notif_btn", "mode": False })
+
+    @globals.web_socket.on("get_auth_status")
+    def get_auth_status(data):
+        instance = Instance(data.get("instance_id"), "web", broadcast=True)
+        auth_enabled = getattr(globals.config, "auth_enabled", False) or getattr(globals.config, "oidc_enabled", False)
+        username = session.get("username", None)
+        auth_type = session.get("auth_type", None)
+        debug_me(session)
+
+        notify_web(
+            instance=instance,
+            event="get_auth_status",
+            data_to_include={
+                "auth_enabled": auth_enabled,
+                "auth_type": auth_type,
+                "username": username
+            }
+        )
 
     @globals.web_socket.on("save_config")
     def save_config_web(data):
@@ -491,27 +895,67 @@ def setup_socket_handlers(
             for key, value in data.get("config").items():
                 new_config_dict[key] = value
 
+            # Normalize the notification channels sent from the web UI into {"url", "events"} form
+            if "apprise_urls" in new_config_dict:
+                new_config_dict["apprise_urls"] = normalize_notification_channels(new_config_dict["apprise_urls"])
+
+            # Auth status before and after
+            basic_before = current_config_dict["auth_enabled"]
+            oidc_before = current_config_dict["oidc_enabled"]
+
+            basic_after = new_config_dict["auth_enabled"]
+            oidc_after = new_config_dict["oidc_enabled"]
+
+            current_auth_type = session.get("auth_type", "auth_disabled")
+
             # Prepare configurations to be compared
             new_config_dict.pop("auth_password")
             new_config_dict.pop("auth_password_hash")
             current_config_dict.pop("auth_password_hash")
 
+            # Ensure a simple change in the order of a list isn't detected as a change
+            config_changed = False
+            for key in new_config_dict:
+                if isinstance(new_config_dict[key], list):
+                    if len(new_config_dict[key]) > 0 and len(current_config_dict[key]) > 0 and isinstance(new_config_dict[key][0], str):
+                        new_list_to_compare = new_config_dict[key]
+                        current_list_to_compare = current_config_dict[key]
+                        if key != "webhook_tpdb_users":
+                            new_list_to_compare.sort()
+                            current_list_to_compare.sort()
+                        config_changed = config_changed or new_list_to_compare != current_list_to_compare
+                    elif len(new_config_dict[key]) != len(current_config_dict[key]):
+                        config_changed = True
+                    else:
+                        # Lists of dicts (notification channels since per-event routing)
+                        # fall through the string branch above; compare them by content
+                        # or an edit inside a channel is never detected as a change.
+                        config_changed = config_changed or new_config_dict[key] != current_config_dict[key]
+                else:
+                    config_changed = config_changed or new_config_dict[key] != current_config_dict[key]
+
             # If the new configuration is the same, return
-            if new_config_dict == current_config_dict and not password_change:
+            if not config_changed and not password_change:
                 update_status(instance, "No configuration change detected", "info", False, False, "info-circle")
+                notify_web(instance, "toggle_config_buttons")
                 return
             
-            if new_config_dict["auth_enabled"] and password:
+            if basic_after and password:
                 if new_config_dict["auth_username"] == current_config_dict["auth_username"] and password_change:
                     update_log(instance, f"🔐 Password changed for user {new_config_dict["auth_username"]}")
                 elif new_config_dict["auth_username"] != current_config_dict["auth_username"]:
-                    update_log(instance, f"🔐 Authentication enabled for user {new_config_dict["auth_username"]}")
+                    update_log(instance, f"🔐 Basic authentication disabled for user {current_config_dict["auth_username"]} and enabled for user {new_config_dict["auth_username"]}")
                 password_hash = AuthenticationService.hash_password(password)
                 new_config_dict["auth_password_hash"] = password_hash
 
-            if not new_config_dict["auth_enabled"]:
-                if current_config_dict["auth_enabled"]:
-                    update_log(instance, f"🔓 Authentication disabled for user {globals.config.auth_username}")
+            if oidc_after and not oidc_before:
+                update_log(instance, f"🫆 OIDC Authentication enabled")
+            if not oidc_after and oidc_before:
+                update_log(instance, "🫆 OIDC Authentication disabled")
+
+            if not basic_after:
+                if basic_before:
+                    update_log(instance, f"🔓 Basic authentication disabled for user {globals.config.auth_username}")
                 new_config_dict["auth_username"] = ""
                 new_config_dict["auth_password_hash"] = ""
 
@@ -524,121 +968,370 @@ def setup_socket_handlers(
             globals.config = config
 
             # Reconnect to Plex because the Plex server or token might have changed
+            instance.broadcast = True
             update_log(instance, "💾 Configuration saved")
             globals.plex.reconnect(config)
+
+            should_log_in_again = (
+                (current_auth_type == "oidc" and not oidc_after and oidc_before) or
+                (current_auth_type == "basic" and not basic_after and basic_before) or
+                (current_auth_type == "auth_disabled" and (basic_after or oidc_after))
+            )
+                                    
+            if should_log_in_again:
+                debug_me("Active authentication method has been disabled or auth has been enabled, logging user out")
+                notify_web(
+                    instance=instance,
+                    event="logout"
+                )
+                return
+            
             notify_web(instance, "save_config", {"saved": True, "config": vars(config)})
+            notify_web(instance, "update_ui", {"config": vars(config)})
+
         except Exception as config_error:
-            update_status(instance, str(config_error), color="warning")
+            update_status(instance, str(config_error), color=StatusColor.WARNING.value)
+
+    @globals.web_socket.on("create_directory")
+    def create_directory(data):
+        instance = Instance(data.get("instance_id"), "web")
+
+        parent_path = data.get("parent_path")
+        folder_name = data.get("folder_name")
+
+        clean_name = os.path.basename(folder_name)
+        target_path = os.path.join(parent_path, clean_name)
+
+        try:
+            os.makedirs(target_path, exist_ok=False)
+            notify_web(instance, "folder_created", {
+                "success": True,
+                "path": target_path
+            })
+            update_status(instance, "Folder created successully", "success", icon="check2-circle", width="modal")
+            update_log(instance, f"✅ Successfully created new folder '{target_path}'")
+        except PermissionError:
+            update_status(instance, "Permission denied", "danger", icon="x-circle", width="modal")
+        except FileExistsError:
+            update_status(instance, "Folder already exists", "warning", icon="exclamation-triangle", width="modal")
+        except Exception as e:
+            update_status(instance, "Failed to create folder, check log for details", "danger", icon="x-circle", width="modal")
+            update_log(f"Faile to create folder: {str(e)}")
+
 
     @globals.web_socket.on("delete_schedule")
     def delete_task_from_scheduler(data):
-        """Delete a scheduled task."""
+        """Delete a scheduled task, addressed by its own id.
+
+        Returns an ack value as well as broadcasting, so a caller that fires
+        several of these in a row (e.g. deleting a file with more than one
+        schedule) can match each response to its own request instead of all
+        of them racing to consume the same "delete_schedule" event.
+        """
         if data.get("instance_id"):
             instance = Instance(data.get("instance_id"), "web")
-            schedule_file = data.get("file")
+            schedule_id = data.get("id")
 
-            if schedule_file:
-                # Get job ID from scheduler service
-                job_id = globals.scheduler_service.get_job_id_by_file(schedule_file)
+            if schedule_id:
+                # Remove from scheduler service
+                removed = globals.scheduler_service.remove_schedule(schedule_id)
 
-                if job_id:
-                    # Remove from scheduler service
-                    globals.scheduler_service.remove_schedule(job_id)
-
+                if removed:
                     # Make sure it's also removed from the config file
                     config.load()
                     config.schedules = [
                         each_schedule
                         for each_schedule in config.schedules
-                        if each_schedule["file"] != schedule_file
+                        if each_schedule.get("id") != schedule_id
                     ]
                     config.save()
 
                     # And update the front-end
-                    notify_web(instance, "delete_schedule", { "file": schedule_file, "job_reference": job_id, "deleted": True })
-                    update_log(instance, f"🗑️ Deleted scheduled task for '{schedule_file}'")
-                    debug_me(f"Deleted scheduled task for '{schedule_file}' with job ID '{job_id}'", "delete_task_from_scheduler")
+                    notify_web(instance, "delete_schedule", { "id": schedule_id, "deleted": True })
+                    update_log(instance, f"🗑️ Deleted scheduled task '{schedule_id}'")
+                    debug_me(f"Deleted scheduled task with job ID '{schedule_id}'")
+                    return {"id": schedule_id, "deleted": True}
                 else:
-                    debug_me(f"Couldn't find a scheduled job for '{schedule_file}'")
-                    notify_web(instance, "delete_schedule", {"deleted": False, "job_id": job_id})
+                    debug_me(f"Couldn't find a scheduled job with ID '{schedule_id}'")
+                    notify_web(instance, "delete_schedule", {"deleted": False, "id": schedule_id})
+                    return {"id": schedule_id, "deleted": False}
+
+    @globals.web_socket.on("get_schedules")
+    def get_schedules(data):
+        """ Gets the list of schedules from the config file and sends it to the frontend """
+        instance = Instance(data.get("instance_id"), "web", broadcast=True)
+
+        schedules = []
+        jobs = globals.scheduler_service.scheduled_jobs
+        for job_id, job in jobs.items():
+            sched = {}
+            meta = globals.scheduler_service.schedule_meta.get(job_id)
+            last_run_at = getattr(job, "last_run", None)
+            next_run_at = getattr(job, "next_run", None)
+            sched["id"] = job_id
+            sched["file"] = meta.get("file")
+            sched["time"] = meta.get("time", None)
+            sched["interval_value"] = meta.get("interval_value", None)
+            sched["interval_unit"] = meta.get("interval_unit", None)
+            sched["last_run"] = last_run_at.isoformat() if last_run_at else ""
+            sched["next_run"] = next_run_at.isoformat() if next_run_at else ""
+            sched["last_run_status"] = meta.get("last_run_status", None)
+            schedules.append(sched)
+            debug_me(f"Job ID: {job_id} ({sched["file"]}) | Last run: {job.last_run}{f' ({sched["last_run_status"]}) ' if sched['last_run_status'] != 'never_run' else ''} | Next run: {job.next_run}")
+
+        notify_web(
+            instance=instance,
+            event="get_schedules",
+            data_to_include={ "schedules": schedules }
+        )
 
     @globals.web_socket.on("add_schedule")
     def add_tasks_to_scheduler(data):
-        """Add a new scheduled task."""
+        """Add a new scheduled task, or update an existing one if an id is given."""
         try:
             # Schedule bulk import task
-            if data.get("instance_id"):
-                instance = Instance(data.get("instance_id"), "web")
-                schedule_file = data.get("file")
-                schedule_time = data.get("time")
+            instance_id = data.pop("instance_id", None)
+            run_now = data.pop("run_now", False)
+            if instance_id:
+                instance = Instance(instance_id, "web")
+                new_schedule = BulkSchedule(**data)
+                if run_now:
+                    new_schedule.next_run = ((datetime.now() + timedelta(minutes=2)).replace(second=0, microsecond=0)).isoformat()
+                elif data.get("last_run_status") == "never_run":
+                    new_schedule.compute_next_run()
+
+                # Validate the shape before anything is persisted or removed: a bad
+                # payload written to config.json would raise on every startup.
+                if not new_schedule.time and not (new_schedule.interval_value and new_schedule.interval_unit in IntervalUnit):
+                    update_log(instance, f"🔴 Rejected invalid schedule for '{new_schedule.file}': needs a daily time or a valid interval")
+                    notify_web(instance, "add_schedule", {"added": False, "file": new_schedule.file})
+                    return {"added": False, "file": new_schedule.file}
+
+                # Editing an existing schedule replaces its job under the same id
+                if new_schedule.id:
+                    globals.scheduler_service.remove_schedule(new_schedule.id)
 
                 # Make sure the schedule is saved as part of the config
                 config.load()
-                update_or_add_schedule(schedule_file, schedule_time)
+                schedule_id = update_or_add_schedule(new_schedule)
                 config.save()
 
                 try:
                     # Create the callback for this schedule
-                    def schedule_callback(filename=schedule_file):
-                        add_file_to_schedule_thread(instance, filename)
+                    def schedule_callback(filename=new_schedule.file, schedule_id=new_schedule.id):
+                        add_file_to_schedule_thread(instance, filename, schedule_id)
 
-                    # Add to scheduler service
-                    job_id = globals.scheduler_service.add_schedule(
-                        schedule_file,
-                        schedule_time,
-                        schedule_callback
-                    )
+                    # Add to scheduler service, keeping the id from config
+                    globals.scheduler_service.add_schedule(new_schedule, schedule_callback)
 
-                    notify_web(instance, "add_schedule", { "added": True, "file": schedule_file, "time": schedule_time, "jobReference": job_id })
-                    update_log(instance, f"⏰ Added scheduled task '{schedule_file}' every day at {schedule_time}")
-                    debug_me(f"Added scheduled task '{schedule_file}' every day at {schedule_time} with job ID '{job_id}'", "add_tasks_to_scheduler")
+                    description = f"every day at {new_schedule.time}" if new_schedule.time else f"every {new_schedule.interval_value} {new_schedule.interval_unit}"
+                    notify_web(instance, "add_schedule", {
+                        "added": True,
+                        "id": schedule_id,
+                        "file": new_schedule.file,
+                        "time": new_schedule.time,
+                        "interval_value": new_schedule.interval_value,
+                        "interval_unit": new_schedule.interval_unit,
+                        "last_run": new_schedule.last_run,
+                        "next_run": new_schedule.next_run,
+                        "last_run_status": new_schedule.last_run_status
+                    })
+                    update_log(instance, f"⏰ Scheduled task '{new_schedule.file}' {description}")
+                    debug_me(f"Scheduled task '{new_schedule.file}' {description} with job ID '{new_schedule.id}'")
                 except Exception as e:
-                    update_log(instance, f"🔴 Failed to add scheduled task '{schedule_file}'")
-                    debug_me(f"Error adding schedule: {e}", "add_tasks_to_scheduler")
+                    update_log(instance, f"🔴 Failed to add scheduled task '{new_schedule.file}'")
+                    debug_me(f"Error adding schedule: {e}")
                     raise
 
                 # Start the scheduler if it's not already started
                 globals.scheduler_service.start()
 
         except Exception as e:
-            debug_me(f"Error in scheduler setup: {e}", "add_tasks_to_scheduler")
+            debug_me(f"Error in scheduler setup: {e}")
             raise
 
-    def update_or_add_schedule(file_name, new_time):
-        """Helper function to update or add a schedule in config."""
+    def update_or_add_schedule(sched: BulkSchedule):
+        """Helper function to update or add a schedule in config. Returns the schedule's id."""
+        entry = {"file": sched.file}
+        if sched.time:
+            entry["time"] = sched.time
+        else:
+            entry["interval_value"] = sched.interval_value
+            entry["interval_unit"] = sched.interval_unit
+        if sched.last_run:
+            entry["last_run"] = sched.last_run
+        entry["next_run"] = sched.next_run
+        entry["last_run_status"] = getattr(sched, "last_run_status", None) or "never_run"
+
         for each_schedule in config.schedules:
-            if each_schedule["file"] == file_name:
-                # Update existing schedule
-                each_schedule["time"] = new_time
-                return
+            if each_schedule.get("id") == sched.id:
+                # Update existing schedule in place, clearing out fields from the old type
+                each_schedule.pop("time", None)
+                each_schedule.pop("interval_value", None)
+                each_schedule.pop("interval_unit", None)
+                each_schedule.pop("last_run", None)
+                each_schedule.pop("next_run", None)
+                each_schedule.pop("las_run_status", None)
+                each_schedule.update(entry)
+                return sched.id
 
         # Add new schedule if not found
-        config.schedules.append({"file": file_name, "time": new_time})
+        new_id = sched.id or str(uuid.uuid4())
+        config.schedules.append({"id": new_id, **entry})
+        return new_id
 
     @globals.web_socket.on("detect_docker")
     def docker_detection(data):
         """Detects whether app is running in docker and informs frontend"""
         instance = Instance(data.get("instance_id"), "web")
         if globals.docker:
-            kometa_base = utils.get_host_path("/assets")
-            temp_dir = utils.get_host_path("/temp")
+            kometa_base = get_host_path("/assets")
+            temp_dir = get_host_path("/temp")
             update_log(instance, f"🐳 Docker environment detected")
-            debug_me(f"Docker detected, Kometa asset path mapped to '{kometa_base}', temp dir mapped to '{temp_dir}'", "docker_detection")
+            debug_me(f"Docker detected, Kometa asset path mapped to '{kometa_base}', temp dir mapped to '{temp_dir}'")
             if kometa_base == "(not defined)":
                 update_log(instance, "⚠️ Kometa base path is not defined in docker-compose.yml file. Saving assets to Kometa asset directory is not available.")
             notify_web(instance, "docker_detected", { "docker": "true", "kometa_base": kometa_base, "temp_dir": temp_dir })
         else:
             notify_web(instance, "docker_detected", { "docker": "false" })
 
+    @globals.web_socket.on("get_scrape_state")
+    def get_scrape_state(data):
+        instance = Instance(data.get("instance_id"), "web")
+
+        scrape_state = {
+            "running": globals.scrapes_running > 0,
+            "type": globals.scrape_type,
+            "main_bar": globals.main_bar,
+            "bulk_bar": globals.bulk_bar
+        }
+        notify_web(instance, "get_scrape_state", scrape_state)
+
+    def abort_stale_upload(file_name):
+        """ Watchdog function that gets executed during a file upload if for some reason the next chunk
+        is not received within the timeout window determined by UPLOAD_CHUNK_TIMEOUT"""
+        debug_me(f"Upload timed out for {file_name}, cleaning up...")
+
+        if file_name not in upload_chunks:
+            return
+
+        upload_info = upload_chunks.pop(file_name)
+        instance = upload_info.get("instance")
+
+        try:
+            upload_info["temp_file"].close()
+            debug_me(f"Temp file successfully closed")
+            if os.path.exists(upload_info["temp_path"]):
+                os.remove(upload_info["temp_path"])
+                debug_me(f"Successfully deleted temp file at {upload_info["temp_path"]}")
+        except Exception as e:
+            debug_me(f"Error removing temp upload file: {str(e)}")
+
+        debug_me(f"CLEANING UP SCRAPE STATE. globals.scrapes_running is currently {globals.scrapes_running} | {globals.scrape_type}")
+        globals.scrapes_running -= 1
+        if globals.scrapes_running <= 0:
+            debug_me(f"Cleanup!")
+            globals.scrapes_running = 0
+            globals.cancel_scrape = False
+            globals.scrape_type = "stopped"
+            globals.main_bar["active"] = False
+
+            if instance:
+                resume_log_file(globals.upload_run_metadata.get("log_file"))   # the watchdog fires on its own thread
+                update_log(instance, f"⚠️ {file_name} • Upload timed out after {UPLOAD_CHUNK_TIMEOUT} seconds (connection lost)")
+                update_status(instance, "Upload timed out", color=StatusColor.DANGER.value)
+                notify_web(instance, "scrape_state", {
+                    "running": False,
+                    "type": "upload"
+                })
+                notify_web(instance, "progress_bar", {
+                    "percent": 100,
+                    "message": f"{file_name} • Upload timed out after {UPLOAD_CHUNK_TIMEOUT} seconds",
+                    "bar_speed": "smooth"
+                })
+
+    @globals.web_socket.on("disconnect")
+    def handle_disconnect():
+        # If a socket disconnects mid-upload, abort all active chunks
+        stale_files = list(upload_chunks.keys())
+        for file_name in stale_files:
+            debug_me(f"Client disconnected during upload of '{file_name}'. Aborting immediately.")
+            if upload_chunks[file_name].get("watchdog"):
+                upload_chunks[file_name]["watchdog"].cancel()
+            
+            abort_stale_upload(file_name)
+            
     @globals.web_socket.on("upload_artwork_chunk")
     def handle_upload_chunk(data):
         """Handle chunked file upload - writes directly to temp file for memory efficiency."""
         
-        instance = Instance(data.get("instance_id"), "web")
+        instance = Instance(data.get("instance_id"), "web", broadcast=True)
         file_name = data["fileName"]
         chunk_data = data["chunkData"]
         chunk_index = data["chunkIndex"]
         total_chunks = data["totalChunks"]
+        total_size = data["totalSize"].__round__(2)
+        bar_speed = "fast"
+        progress_MB = ((chunk_index * UPLOAD_CHUNK_SIZE ) / 1000000).__round__(2)
+        start_time = data["startTime"]
+        run_start = datetime.fromtimestamp(start_time / 1000.0, tz=timezone.utc).isoformat()
+        current_time = data["currentTime"]
+
+        if chunk_index == 0:
+            globals.cancel_scrape = False
+            globals.scrapes_running += 1
+            globals.scrape_type = "upload"
+
+            globals.upload_run_metadata = {}
+            run_label = file_name.split(".zip")[0].strip()
+            clean_file_name = run_label.replace(" (", "_").replace(")", "").replace(" - ", "_").replace(" • ", "_").replace(" ", "_")
+            log_label = f"upload_{clean_file_name}"
+            globals.upload_run_metadata["run_label"] = run_label
+            globals.upload_run_metadata["start_time"] = run_start
+            globals.upload_run_metadata["log_file"] = log_to_file(log_label)
+
+            update_log(instance, f"📤 {file_name} • Upload initiated")
+            debug_me(f"Uploading '{file_name}")
+            notify_web(instance, "scrape_state", { "running": True, "type": globals.scrape_type })
+        else:
+            # Every chunk arrives on its own handler thread, so pick the run's log file back up
+            resume_log_file(globals.upload_run_metadata.get("log_file"))
+
+        if globals.cancel_scrape:
+            debug_me(f"File upload canceled by user")
+            update_log(instance, f"🛑 {file_name} • File upload canceled by user")
+            update_status(instance, f"File upload canceled by user", color=StatusColor.WARNING.value)
+            if file_name in upload_chunks:
+                if upload_chunks[file_name].get("watchdog"):
+                    upload_chunks[file_name]["watchdog"].cancel()
+                try:
+                    upload_chunks[file_name]["temp_file"].close()
+                    if os.path.exists(upload_chunks[file_name]["temp_path"]):
+                        os.remove(upload_chunks[file_name]["temp_path"])
+                except Exception:
+                    pass
+                del upload_chunks[file_name]
+
+                RunHistory().add_run(
+                    run_type=RunType.UPLOAD.value,
+                    label=globals.upload_run_metadata.get("run_label", "unknown"),
+                    started_at=globals.upload_run_metadata.get("start_time", datetime.now(timezone.utc).isoformat()),
+                    ended_at=datetime.now(timezone.utc).isoformat(),
+                    trigger=RunTrigger.MANUAL.value,
+                    outcome=RunOutcome.STOPPED.value
+                )
+
+            globals.scrapes_running -= 1
+            if globals.scrapes_running <= 0:
+                globals.scrapes_running = 0
+                globals.cancel_scrape = False
+                notify_web(instance, "scrape_state", { "running": False, "type": globals.scrape_type })
+                globals.scrape_type = "stopped"
+                globals.main_bar["active"] = False
+                notify_web(instance, "progress_bar", { "percent": 100, "message": f"{file_name} • Upload canceled by user", "bar_speed": "smooth" })
+                globals.last_emit_time = 0
+            return "abort"
+
         if file_name not in upload_chunks:
             # Create a temporary file to stream chunks to disk instead of memory
             temp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.upload')            
@@ -647,79 +1340,126 @@ def setup_socket_handlers(
                 "temp_path": temp_file.name,
                 "chunks_received": 0,
                 "total_chunks": total_chunks,
-                "instance": instance
+                "instance": instance,
+                "watchdog": None
             }
+
+        # When a chunk is processed, we reset the watchdog
+        if upload_chunks[file_name].get("watchdog"):
+            upload_chunks[file_name]["watchdog"].cancel()
+
+        # And we re-start it immediately
+        timer = threading.Timer(
+            interval=UPLOAD_CHUNK_TIMEOUT,
+            function=abort_stale_upload,
+            args=[file_name]
+        )
+        timer.daemon = True
+        timer.start()
+        upload_chunks[file_name]["watchdog"] = timer
 
         # Decode and write chunks directly to disk
         try:
             decoded_chunk = base64.b64decode(chunk_data)
             upload_chunks[file_name]["temp_file"].write(decoded_chunk)
             upload_chunks[file_name]["chunks_received"] += 1
+            percent = (progress_MB * 100 / total_size).__round__(2) if total_size else 0.0
+            # Browsers coarsen performance.now() (Firefox to 1 ms), so the first chunk can carry
+            # identical timestamps; a zero interval must not turn into a swallowed exception
+            # that leaves the chunk unacknowledged.
+            elapsed_ms = current_time - start_time
+            current_rate = ((progress_MB * 1000) / elapsed_ms).__round__(2) if elapsed_ms > 0 else 0.0
+            message = f"{file_name} • {progress_MB} MB of {total_size} MB • {current_rate} MB/s"
+            notify_web(instance, "progress_bar", { "percent": percent, "message": message, "bar_speed": bar_speed}, silent=True )
+                
+            globals.main_bar["active"] = True
+            globals.main_bar["percent"] = percent
+            globals.main_bar["speed"] = bar_speed
+            globals.main_bar["message"] = message
+
             return "ok"
         except Exception as e:
-            debug_me(f"Error decoding chunk {chunk_index + 1}: {str(e)}", "handle_upload_chunk")
+            debug_me(f"Error decoding chunk {chunk_index + 1}: {str(e)}")
+            globals.scrapes_running -= 1
+            if globals.scrapes_running <= 0:
+                globals.scrapes_running = 0
+                globals.cancel_scrape = False
+                notify_web(instance, "scrape_state", { "running": False, "type": globals.scrape_type })
+                globals.scrape_type = "stopped"
+                globals.main_bar["active"] = False
+                notify_web(instance, "progress_bar", { "percent": 100, "message": f"{file_name} • Error uploading file", "bar_speed": "fast"} )
             return "error"
 
     @globals.web_socket.on("upload_complete")
     def handle_upload_complete(data):
         """Finalize the upload once all chunks are received."""
+        instance = Instance(data.get("instance_id"), "web", broadcast=True)
         file_name = data.get("fileName")
+        # This handler runs on its own thread too, and the processing that follows records the run
+        resume_log_file(globals.upload_run_metadata.get("log_file"))
+
+        notify_web(instance, "progress_bar", { "percent": 100, "message": f"{file_name} • Upload complete!", "bar_speed": "fast"} )
+
         filters = data.get("filters")
         plex_year = data.get("plex_year")
         plex_title = data.get("plex_title")
         options = data.get("options")
-        debug_me(f"Obtained filters from web form: {filters}", "handle_upload_complete")
-        debug_me(f"Obtained options from web form: {options}", "handle_upload_complete")
+        debug_me(f"Obtained filters from web form: {filters}")
+        debug_me(f"Obtained options from web form: {options}")
 
-        instance = Instance(data.get("instance_id"), "web")
 
-        if file_name in upload_chunks and upload_chunks[file_name]["chunks_received"] == int(
-            upload_chunks[file_name]["total_chunks"]
-        ):
-            temp_path = upload_chunks[file_name]["temp_path"]
-            debug_me(f"Uploaded {file_name} to {temp_path}, processing file...", "handle_upload_complete")
-            upload_chunks[file_name]["temp_file"].close()
-            update_log(instance, f"✔️ {file_name} • Upload completed successfully")
-            save_uploaded_file(
-                instance,
-                file_name,
-                options,
-                filters,
-                plex_title,
-                plex_year,
-                upload_chunks,
-                filename_pattern,
-                check_image_orientation,
-                sort_key
-            )
-
-            # Cleanup after saving the file
+        if file_name in upload_chunks:
+            if upload_chunks[file_name].get("watchdog"):
+                upload_chunks[file_name]["watchdog"].cancel()
             try:
+                upload_chunks[file_name]["temp_file"].close()
+            except Exception as e:
+                debug_me(f"Unable to close temp file: {str(e)}")
+
+            if upload_chunks[file_name]["chunks_received"] == int(upload_chunks[file_name]["total_chunks"]):
                 temp_path = upload_chunks[file_name]["temp_path"]
-                # Delete the temp file if it still exists
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                # Delete the metadata for the file
-                del upload_chunks[file_name]
-            except OSError as e:
-                debug_me(f"Error during cleanup: {str(e)}", "handle_upload_complete")
-        else:
-            chunks_received = upload_chunks[file_name]["chunks_received"] if file_name in upload_chunks else 0
-            expected_chunks = upload_chunks[file_name]["total_chunks"] if file_name in upload_chunks else 0
-            debug_me(
-                f'Upload complete event received for {file_name}, but with '
-                f'{chunks_received} of {expected_chunks}, some chunks are missing.',
-                "handle_upload_complete"
-            )
-            try:
-                # Clean up temp file
-                if file_name in upload_chunks:
-                    upload_chunks[file_name]["temp_file"].close()
+                debug_me(f"Uploaded {file_name} to {temp_path}, processing file...")
+                upload_chunks[file_name]["temp_file"].close()
+                update_log(instance, f"✔️ {file_name} • Upload completed successfully")
+                save_uploaded_file(
+                    instance,
+                    file_name,
+                    options,
+                    filters,
+                    plex_title,
+                    plex_year,
+                    upload_chunks,
+                    filename_pattern,
+                    check_image_orientation,
+                    sort_key
+                )
+
+                # Cleanup after saving the file
+                try:
                     temp_path = upload_chunks[file_name]["temp_path"]
+                    # Delete the temp file if it still exists
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
-            except OSError as e:
-                debug_me(f"Error during cleanup: {str(e)}", "handle_upload_complete")
+                    # Delete the metadata for the file
+                    del upload_chunks[file_name]
+                except OSError as e:
+                    debug_me(f"Error during cleanup: {str(e)}")
+            else:
+                chunks_received = upload_chunks[file_name]["chunks_received"] if file_name in upload_chunks else 0
+                expected_chunks = upload_chunks[file_name]["total_chunks"] if file_name in upload_chunks else 0
+                debug_me(
+                    f'Upload complete event received for {file_name}, but with '
+                    f'{chunks_received} of {expected_chunks}, some chunks are missing.'
+                )
+                try:
+                    # Clean up temp file
+                    if file_name in upload_chunks:
+                        upload_chunks[file_name]["temp_file"].close()
+                        temp_path = upload_chunks[file_name]["temp_path"]
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                except OSError as e:
+                    debug_me(f"Error during cleanup: {str(e)}")
 
 
 def save_uploaded_file(
@@ -752,46 +1492,85 @@ def save_uploaded_file(
 
     # Get the temp file path that was used during chunk uploads
     temp_upload_path = upload_chunks[file_name]["temp_path"]
-    debug_me(f"Processing uploaded file {file_name} from temp path: {temp_upload_path}", "save_uploaded_file")
+    debug_me(f"Processing uploaded file {file_name} from temp path: {temp_upload_path}")
 
-    # Move to a proper file location with correct filename for processing
+    # Both directories belong to this call. The artwork dictionaries hold paths into extract_dir,
+    # so it has to survive extract_and_list_zip and can only go once the processing below has read
+    # them. The finally covers the cancel path and any failure, which otherwise left the uploaded
+    # archive and every extracted image behind for the life of the container.
     temp_zip_folder = tempfile.mkdtemp()
-    temp_zip_path = os.path.join(temp_zip_folder, file_name)
-    
-    import shutil
-    shutil.move(temp_upload_path, temp_zip_path)
-    debug_me(f"Moved {file_name} to temporary path: {temp_zip_folder}", "save_uploaded_file")
-
-    debug_me(f"Saved ZIP file: {temp_zip_path}", "save_uploaded_file")
-
-    update_log(instance, f"📦 {os.path.basename(temp_zip_path)} • Extracting ZIP file and parsing files...")
-    extracted_files, skipped, zip_title, zip_author, zip_source = extract_and_list_zip(
-        instance,
-        temp_zip_path,
-        filename_pattern,
-        filters,
-        plex_title,
-        plex_year,
-        check_image_orientation_func,
-        sort_key_func
-    )
-
-    # Delete the ZIP file after extraction
+    extract_dir = tempfile.mkdtemp()
     try:
-        os.remove(temp_zip_path)
-        os.rmdir(temp_zip_folder)
-        debug_me(f"Deleted temporary ZIP file: {temp_zip_path}", "save_uploaded_file")
-    except Exception as e:
-        debug_me(f"Error deleting temporary ZIP file: {e}", "save_uploaded_file")
+        # Move to a proper file location with correct filename for processing
+        temp_zip_path = os.path.join(temp_zip_folder, file_name)
 
-    process_uploaded_artwork(instance, extracted_files, skipped, zip_title, zip_author, zip_source, options, filters, plex_title, plex_year)
+        shutil.move(temp_upload_path, temp_zip_path)
+        debug_me(f"Moved {file_name} to temporary path: {temp_zip_folder}")
 
-    update_status(instance, "Finished processing uploaded file.", color="success")
+        debug_me(f"Saved ZIP file: {temp_zip_path}")
 
+        update_log(instance, f"📦 {os.path.basename(temp_zip_path)} • Extracting ZIP file and parsing files...")
+        extracted_files, skipped, zip_title, zip_author, zip_source = extract_and_list_zip(
+            instance,
+            temp_zip_path,
+            extract_dir,
+            filename_pattern,
+            filters,
+            plex_title,
+            plex_year,
+            check_image_orientation_func,
+            sort_key_func
+        )
+        if globals.cancel_scrape:
+            notify_web(instance, "progress_bar", {"message": "Parsing canceled by user...", "percent": 100})#, "bar_type": bar_type, "bar_speed": bar_speed})
+            globals.main_bar["active"] = False
+            update_log(instance, f"🛑 {os.path.basename(temp_zip_path)} • ZIP file parsing canceled by user")
+            update_status(instance, f"ZIP file parsing canceled by user", color=StatusColor.WARNING.value)
+            RunHistory().add_run(
+                run_type=RunType.UPLOAD.value,
+                label=globals.upload_run_metadata.get("run_label", "unknown"),
+                started_at=globals.upload_run_metadata.get("start_time", datetime.now(timezone.utc).isoformat()),
+                ended_at=datetime.now(timezone.utc).isoformat(),
+                trigger=RunTrigger.MANUAL.value,
+                outcome=RunOutcome.STOPPED.value
+            )
+            globals.scrapes_running -= 1
+            if globals.scrapes_running <= 0:
+                globals.scrapes_running = 0
+                globals.cancel_scrape = False
+                notify_web(instance, "scrape_state", { "running": False, "type": globals.scrape_type })
+                globals.scrape_type = "stopped"
+            return
+
+        # Delete the ZIP file after extraction, so it is not held while the artwork is processed
+        try:
+            os.remove(temp_zip_path)
+            debug_me(f"Deleted temporary ZIP file: {temp_zip_path}")
+        except OSError as e:
+            debug_me(f"Error deleting temporary ZIP file: {e}")
+
+        process_uploaded_artwork(instance, extracted_files, skipped, zip_title, zip_author, zip_source, options, filters, plex_title, plex_year)
+
+        if globals.cancel_scrape:
+            update_status(instance, "Uploaded file processing canceled by user", color=StatusColor.WARNING.value)
+        else:
+            update_status(instance, "Finished processing uploaded file", color=StatusColor.SUCCESS.value)
+
+        globals.scrapes_running -= 1
+        if globals.scrapes_running <= 0:
+            globals.scrapes_running = 0
+            globals.cancel_scrape = False
+            notify_web(instance, "scrape_state", { "running": False, "type": globals.scrape_type })
+            globals.scrape_type = "stopped"
+    finally:
+        shutil.rmtree(temp_zip_folder, ignore_errors=True)
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        debug_me(f"Removed temporary directories {temp_zip_folder} and {extract_dir}")
 
 def extract_and_list_zip(
     instance: Instance,
     zip_path: str,
+    extract_dir: str,
     filename_pattern: re.Pattern,
     filters: list,
     plex_title: str,
@@ -804,6 +1583,8 @@ def extract_and_list_zip(
 
     Args:
         zip_path: Path to the ZIP file
+        extract_dir: Directory to extract into. The returned artwork dictionaries hold paths
+            into it, so the caller creates it and removes it once it has finished reading them
         filename_pattern: Regex pattern for validating filenames
         check_image_orientation_func: Function to check image orientation
         sort_key_func: Function to generate sort keys
@@ -811,52 +1592,63 @@ def extract_and_list_zip(
     Returns:
         List of artwork dictionaries sorted by media type, season, episode
     """
-    extract_dir = tempfile.mkdtemp()
     file_list = []
-    zip_source = "theposterdb"
+    zip_title = ""
+    zip_author = ""
     filtered_files = 0
     errored_files = 0
 
-    debug_me(f"Extracting ZIP file: {zip_path} to {extract_dir}", "extract_and_list_zip")
+    debug_me(f"Extracting ZIP file: {zip_path} to {extract_dir}")
 
     # For ThePosterDB, extract title and author from filename
     pattern = r"^(?P<title>.+?)\s+set by\s+(?P<author>.+?)\s*-"
     match = re.search(pattern, os.path.basename(zip_path), re.IGNORECASE)
     if match:
+        zip_source = ScraperSource.THEPOSTERDB.value
         zip_title = match.group("title").strip()
         zip_author = match.group("author").strip()
-        debug_me(f"Detected ThePosterDB source", "extract_and_list_zip")
-        debug_me(f"Detected ZIP title: {zip_title}", "extract_and_list_zip")
-        debug_me(f"Detected ZIP author: {zip_author}", "extract_and_list_zip")
+        debug_me(f"Detected ThePosterDB source")
+        debug_me(f"Detected ZIP title: {zip_title}")
+        debug_me(f"Detected ZIP author: {zip_author}")
     else:
-        zip_source = "mediux"
+        zip_source = ScraperSource.MEDIUX.value
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         # Pre-process the file list to determine source and extract valid files
         zip_infos = [zip_info for zip_info in zip_ref.infolist() if os.path.basename(zip_info.filename) and not os.path.basename(zip_info.filename).startswith(".") and os.path.basename(zip_info.filename) not in {"ds_store", "__macosx"}]
         total_files_in_zip = len(zip_infos)
         
-        update_status(instance, "Extracting ZIP file...", "info", sticky=True, spinner=True)
         notify_web(instance, "progress_bar", { "percent": 0, "message": "Parsing...", "bar_type": "main", "bar_speed": "fast" })
+        globals.main_bar["active"] = False
+       
+        identified_media_map = {}
+
         for n, zip_info in enumerate(zip_infos, 1):
+            if globals.cancel_scrape:
+                break
             filename = os.path.basename(zip_info.filename)  # Get filename only (ignore paths)
-            debug_me(f"{n} / {total_files_in_zip} • Processing '{filename}'", "extract_and_list_zip")
+            debug_me(f"{n} / {total_files_in_zip} • Processing '{filename}'")
             percent = (n/total_files_in_zip)*100 if total_files_in_zip > 0 else 0
-            notify_web(instance, "progress_bar", { "percent": percent, "message": f"Parsing {n} of {total_files_in_zip} • {filename}", "bar_type": "main", "bar_speed": "fast" })
+            message = f"Parsing {n} of {total_files_in_zip} • {filename}"
+            notify_web(instance, "progress_bar", { "percent": percent, "message": message, "bar_type": "main", "bar_speed": "fast" })
+            globals.main_bar["active"] = True
+            globals.main_bar["percent"] = percent
+            globals.main_bar["message"] = message
+            globals.main_bar["speed"] = "fast"
 
             # Mediux ZIP files contain a source.txt file with metadata, we obtain title and author from there
             if filename == "source.txt":
-                debug_me("Detected Mediux source", "extract_and_list_zip")
-                zip_source = "mediux"
+                debug_me("Detected Mediux source")
+                zip_source = ScraperSource.MEDIUX.value
                 with zip_ref.open(zip_info) as source, open(os.path.join(extract_dir, "source.txt"), "wb") as target:
                     target.write(source.read())
                 with open(os.path.join(extract_dir, "source.txt"), "r", encoding="utf-8") as source_file:
                     for line in source_file:
                         if line.startswith("Title:"):
                             zip_title = line.split("Title:")[1].strip()
-                            debug_me(f"Detected ZIP title: {zip_title}", "extract_and_list_zip")
+                            debug_me(f"Detected ZIP title: {zip_title}")
                         if line.startswith("Author:"):
                             zip_author = line.split("Author:")[1].strip()
-                            debug_me(f"Detected ZIP author: {zip_author}", "extract_and_list_zip")
+                            debug_me(f"Detected ZIP author: {zip_author}")
                             break
                 os.remove(os.path.join(extract_dir, "source.txt"))  # Clean up source.txt after obtaining author info
                 
@@ -866,12 +1658,21 @@ def extract_and_list_zip(
                 with zip_ref.open(zip_info) as source, open(full_path, "wb") as target:
                     target.write(source.read())
 
-                #full_path = os.path.join(extract_dir, filename)
-                md5 = utils.calculate_file_md5(full_path)
+                md5 = calculate_file_md5(full_path)
 
                 # Obtain artwork title, year, media type, season, episode and artwork type by parsing the filename
-                debug_me(f"Parsing artwork metadata from filename: {filename}", "extract_and_list_zip")
+                debug_me(f"Parsing artwork metadata from filename: {filename}")
                 artwork = parse_title(os.path.splitext(filename)[0])
+
+                if artwork["media"] == "unable_to_parse":
+                    update_log(instance, f"❌ {filename} • {zip_author} | Unable to parse file name, format unrecognized")
+                    errored_files += 1
+                    continue
+                
+                # We start building a Title -> Media map with the media type (Movie, TV, Collection) correctly parsed by parse_title
+                if artwork["media"] != "Unknown" and artwork["title"] not in identified_media_map:
+                    identified_media_map[artwork["title"]] = artwork["media"]
+
                 # Override title and year if provided
                 artwork["title"] = plex_title if plex_title else artwork["title"]
                 artwork["year"] = plex_year if plex_year else artwork.get("year")
@@ -885,27 +1686,26 @@ def extract_and_list_zip(
                 # and year in the process for better matching later when processing artwork items
                 if artwork["media"] != "Collection":
                     media_type, tmdb_id, title, year = globals.plex.movie_or_show(artwork.get('title'), artwork.get('year'))
-                    if media_type == "unavailable" or "Error" in media_type:
-                        # Mediux and TPDB replace colons with hyphens in titles, so revert that for lookup, and also remove ellipses
-                        artwork["title"] = re.sub(r'-', '', artwork.get('title')).replace('...', '').strip()
-                        media_type, tmdb_id, title, year = globals.plex.movie_or_show(artwork.get('title'), artwork.get('year'))
-                        if media_type == "DNSError":
-                            update_log(instance, f"❌ {filename} • {zip_author} | Error searching Plex: Cannot resolve server name")
-                            errored_files += 1
-                            continue
-                        elif media_type == "ConnectionError":
-                            update_log(instance, f"❌ {filename} • {zip_author} | Error searching Plex: Connection error")
-                            errored_files += 1
-                            continue
-                        elif media_type == "TimeoutError":
-                            update_log(instance, f"❌ {filename} • {zip_author} | Error searching Plex: Timed out")
-                            errored_files += 1
-                            continue
-                        elif media_type == "Error":
-                            update_log(instance, f"❌ {filename} • {zip_author} | Error searching Plex")
-                            errored_files += 1
-                            continue
-                    artwork["media"] = media_type
+                    if "Error" in media_type:
+                        update_log(instance, f"❌ {filename} • {zip_author} | Error searching Plex")
+                        errored_files += 1
+                        continue
+
+                    # If we got a result from movie_or_show, we use that media type and we update the identified media map because the movie_or_show method is more accurate
+                    if media_type != "unavailable":
+                        artwork["media"] = media_type
+                        identified_media_map[artwork["title"]] = media_type
+
+                    # If we got "unavailable" from movie_or_show and we've already identified that title as a certain media type from another file, we use that
+                    elif artwork["title"] in identified_media_map:
+                        artwork["media"] = identified_media_map[artwork["title"]]
+
+                    # Otherwise we set it to "unavailable"
+                    # If we got "unavailable" from movie_or_show and we got "Unknown" from parse_title, we set it to "unavailable"
+                    elif media_type == "unavailable" and artwork["media"] == "Unknown":
+                        artwork["media"] = media_type
+                    # If we get here and none of fhe above conditions are met, we have kept whatever media_type was determined by parse_title
+
                     artwork["title"] = title if title and title != artwork.get('title') else artwork.get('title')
                     artwork["tmdb_id"] = tmdb_id
                     if artwork.get('year') is None and year is not None:
@@ -913,64 +1713,86 @@ def extract_and_list_zip(
                 if artwork['media'] == "TV Show":
                     if artwork['season'] is None:
                         artwork['season'] = "Cover"
-                        artwork['type'] = "show_cover"
+                        artwork['file_type'] = "show_cover"
                     if artwork['season'] == "Cover" and check_image_orientation_func(artwork["path"]) == "landscape":
                         artwork['season'] = "Backdrop"
-                        artwork['type'] = "background"
+                        artwork['file_type'] = "background"
                 if artwork['media'] == "Movie":
                     if check_image_orientation_func(artwork["path"]) == "landscape":
-                        artwork['type'] = "background"
-                    elif artwork['type'] == "square_art" or check_image_orientation_func(artwork["path"]) == "square":
-                        artwork['type'] = "square_art"
+                        artwork['file_type'] = "background"
+                    elif artwork['file_type'] == "square_art" or check_image_orientation_func(artwork["path"]) == "square":
+                        artwork['file_type'] = "square_art"
                     else:
-                        artwork['type'] = "movie_poster"
+                        artwork['file_type'] = "movie_poster"
                 if artwork['media'] == "Collection":
                     if check_image_orientation_func(artwork["path"]) == "landscape":
-                        artwork['type'] = "background"
-                    if check_image_orientation_func(artwork["path"]) == "square":
-                        artwork['type'] = "square_art"
+                        artwork['file_type'] = "background"
+                    elif check_image_orientation_func(artwork["path"]) == "square":
+                        artwork['file_type'] = "square_art"
                 if artwork['media'] == "unavailable":
                     if check_image_orientation_func(artwork["path"]) == "landscape":
-                        artwork['type'] = "background"
-                    if check_image_orientation_func(artwork["path"]) == "square":
-                        artwork['type'] = "square_art"
-                    if artwork['type'] == "season_cover":
+                        artwork['file_type'] = "background"
+                    elif check_image_orientation_func(artwork["path"]) == "square" or "OST" in artwork["path"]:
+                        artwork['file_type'] = "square_art"
+                    elif artwork['file_type'] == "season_cover":
                         artwork['media'] = "TV Show"
                     else:
                         # If we get to this point, there is no way to determine if it's a TV show or Movie, so default to poster
-                        # However this won't pass any filters (becuase it's either "movie_poster" or "show_cover"), so this artwork won't be processed further
-                        artwork['type'] = "poster"  
+                        # However this won't pass any filters (becuase it's either "movie_poster" or "show_cover"), so this artwork won't be 
+                        # processed further if any filters are specified. It will only be processed if no filters are set.
+                        artwork['file_type'] = "poster"  
 
                 # Check for filters and exclusions
-                if not filters or artwork["type"] in filters:
+                if not filters or artwork["file_type"] in filters:
                     debug_me(
-                        f"✅ Including {artwork["type"].replace('_', ' ')} "
+                        f"✅ Including {artwork["file_type"].replace('_', ' ')} "
                         f"for '{artwork['title']}"
                         + (f" ({artwork['year']})'" if artwork['year'] is not None else "")
                         + (f", Season {artwork['season']}" if isinstance(artwork['season'], int) else "")
                         + (f", Episode {artwork['episode']}" if isinstance(artwork['episode'], int) else "")
-                        + f". Type is {artwork['type']}.", "extract_and_list_zip"
+                        + f". Type is {artwork['file_type']}."
                     )
 
                     file_list.append(artwork)
                 else:
                     debug_me(
-                        f"⏩ Skipping {artwork["type"].replace('_', ' ')} "
+                        f"⏩ Skipping {artwork["file_type"].replace('_', ' ')} "
                         f"for '{artwork['title']}"
                         + (f" ({artwork['year']})'" if artwork['year'] is not None else "")
                         + (f", Season {artwork['season']}" if isinstance(artwork['season'], int) else "")
                         + (f", Episode {artwork['episode']}" if isinstance(artwork['episode'], int) else "")
-                        + f" based on filters. Type is {artwork['type']} and filters are {filters}.", "extract_and_list_zip"
+                        + f" based on filters. Type is {artwork['file_type']} and filters are {filters}."
                     )
                     filtered_files += 1
 
+    # Final clean-up in an effort to leave as few assets as possible unidentified
+    final_file_list = []
+    tv_sq_art = 0
+    for artwork in file_list:
+        # If the media type was not identified for a file but later we identified the title and
+        # added it to the identified_media_map, we go back and update all assets for that same title
+        if artwork["media"] == "unavailable" and artwork["title"] in identified_media_map:
+            artwork["media"] = identified_media_map[artwork["title"]]
+        # If the season and espisode are None but we identified it as a TV Show
+        # then this means the asset is a show cover
+        if artwork["season"] is None and artwork["episode"] is None and artwork["media"] == MediaType.TV_SHOW.value:
+            artwork["season"] = "Cover"
+            artwork["file_type"] = FileType.SHOW_COVER.value
+        # We tag the square_art assets sequentially in their "season" field so that
+        # the UploadProcessor can process the first one and decide what to do with the rest
+        if artwork["season"] == "SquareArt":
+            artwork["season"] = f"SquareArt_{tv_sq_art}"
+            tv_sq_art += 1
+        
+        final_file_list.append(artwork)
+
     total_files = len(os.listdir(extract_dir))
 
-    sorted_data = sorted(file_list, key=sort_key_func)
+    sorted_data = sorted(final_file_list, key=sort_key_func)
 
-    debug_me(f"❌ Encountered {errored_files} error(s) parsing filenames", "extract_and_list_zip")
-    debug_me(f"⏩ Skipped {filtered_files} assets(s) out of {total_files} based on filters).", "extract_and_list_zip")
-    debug_me(f"✅ Included {len(sorted_data)} assets:", "extract_and_list_zip")
+    debug_me(f"❌ Encountered {errored_files} error(s) parsing filenames")
+    debug_me(f"⏩ Skipped {filtered_files} assets(s) out of {total_files} based on filters).")
+    debug_me(f"✅ Included {len(sorted_data)} assets:")
     debug_me(sorted_data)
 
     return sorted_data, filtered_files, zip_title, zip_author, zip_source
@@ -986,6 +1808,7 @@ def start_web_server(web_app, web_host: str, web_port: int, debug: bool = False)
         web_port: Port to bind to
         debug: Whether to run in debug mode
     """
+    debug_me(f"Initiating web server on port {web_port}")
     flask.cli.show_server_banner = lambda *args: None
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)

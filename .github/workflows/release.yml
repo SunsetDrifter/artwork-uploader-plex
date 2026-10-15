@@ -9,9 +9,16 @@ permissions:
   contents: write
   packages: write
   id-token: write
+  pull-requests: read  # Required for --generate-notes to read PR metadata
 
 jobs:
+  # Publishing a tag with a failing suite is the one mistake a release workflow
+  # can make that nobody can undo, so the tests gate everything below.
+  test:
+    uses: ./.github/workflows/tests.yml
+
   create-release:
+    needs: test
     runs-on: ubuntu-latest
 
     steps:
@@ -42,7 +49,7 @@ jobs:
           fi
 
       # ----------------------------
-      # Docker setup
+      # Docker setup & push
       # ----------------------------
 
       - name: Set up QEMU
@@ -77,21 +84,8 @@ jobs:
           labels: ${{ steps.docker_meta.outputs.labels }}
 
       # ----------------------------
-      # Create release artifacts
+      # Create release artifacts & GitHub Release
       # ----------------------------
-
-      - name: Generate changelog
-        run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          if [ -z "$PREV_TAG" ]; then
-            CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
-          else
-            CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
-          fi
-
-          echo "## What's Changed" > CHANGELOG.md
-          echo "" >> CHANGELOG.md
-          echo "$CHANGELOG" >> CHANGELOG.md
 
       - name: Create source distribution
         run: |
@@ -105,5 +99,5 @@ jobs:
         run: |
           gh release create "${{ steps.get_version.outputs.TAG }}" \
             --title "Release ${{ steps.get_version.outputs.TAG }}" \
-            --notes-file CHANGELOG.md \
+            --generate-notes \
             dist/*.zip dist/*.tar.gz

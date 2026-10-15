@@ -3,6 +3,7 @@ Application-wide constants.
 """
 
 from core.__version__ import __version__, __url__
+from core.enums import ArtworkIDPrefix, FileType, MediaType, NotificationEvent
 
 # Application metadata
 APP_NAME = "Artwork Uploader for Plex"
@@ -19,12 +20,23 @@ DEFAULT_WEB_HOST = "0.0.0.0"
 
 # File paths
 DEFAULT_CONFIG_PATH = "config.json"
+ASSET_INDEX_PATH = "config/asset_index.db"
 DEFAULT_BULK_IMPORTS_DIR = "bulk_imports"
 DEFAULT_BULK_IMPORT_FILE = "bulk_import.txt"
+RUN_HISTORY_PATH = "config/run_history.json"
+DEFAULT_LOG_PATH = "logs"
+
+# Run history retention (whichever limit is hit first prunes the record).
+# The entry cap is per run type, so frequent webhook imports can't crowd out bulk runs.
+RUN_HISTORY_MAX_ENTRIES = 200
+RUN_HISTORY_MAX_AGE_DAYS = 90
 
 # Plex library defaults
 DEFAULT_TV_LIBRARY = ["TV Shows"]
 DEFAULT_MOVIE_LIBRARY = ["Movies"]
+
+# Plex library index refresh timeout (seconds)
+PLEX_LIBRARY_INDEX_TIMEOUT = 6 * 60 * 60 # Default 6 hours
 
 # Filter types - valid artwork types that can be filtered
 FILTER_TITLE_CARD = "title_card"
@@ -46,9 +58,44 @@ ALL_FILTERS = [
 # Artwork ID prefixes (for Plex labels)
 ARTWORK_ID_BACKGROUND = "BID:"
 ARTWORK_ID_SHOW_COVER = "CID:"
+ARTWORK_ID_SQUARE_ART = "SAID:"
 ARTWORK_ID_POSTER = "PID:"
 ARTWORK_ID_SEASON = "SID:"
 ARTWORK_ID_EPISODE = "EID:"
+
+# Artwork type to Plex label prefix mapping
+ARTWORK_ID_MAP = {
+    FileType.BACKGROUND.value: ArtworkIDPrefix.BACKGROUND.value,
+    FileType.SQUARE_ART.value: ArtworkIDPrefix.SQUARE_ART.value,
+    FileType.SHOW_COVER.value: ArtworkIDPrefix.SHOW_COVER.value,
+    FileType.MOVIE_POSTER.value: ArtworkIDPrefix.POSTER.value,
+    FileType.COLLECTION_POSTER.value: ArtworkIDPrefix.POSTER.value,
+    FileType.SEASON_COVER.value: ArtworkIDPrefix.SEASON.value,
+    FileType.TITLE_CARD.value: ArtworkIDPrefix.EPISODE.value
+}
+
+# Artwork type to display string mapping
+ARTWORK_TYPE_MAP = {
+    FileType.BACKGROUND.value: "Background",
+    FileType.SQUARE_ART.value: "Square art",
+    FileType.SHOW_COVER.value: "Show cover",
+    FileType.MOVIE_POSTER.value: "Poster",
+    FileType.COLLECTION_POSTER.value: "Collection poster",
+    FileType.SEASON_COVER.value: "Season cover",
+    FileType.TITLE_CARD.value: "Title card"
+}
+
+# Artwork type to Kometa asset filename mapping. Kometa's item-level asset names are
+# lowercase on disk (poster.ext / background.ext / square.ext) and its matching is
+# case-sensitive on Linux, so these must not use the display strings above.
+ARTWORK_FILENAME_MAP = {
+    FileType.BACKGROUND.value: "background",
+    FileType.BACKDROP.value: "background",
+    FileType.SQUARE_ART.value: "square",
+    FileType.MOVIE_POSTER.value: "poster",
+    FileType.COLLECTION_POSTER.value: "poster",
+    FileType.POSTER.value: "poster",
+}
 
 # Media types
 MEDIA_TYPE_TV_SHOW = "TV Show"
@@ -65,6 +112,20 @@ TPDB_BASE_URL = "https://theposterdb.com"
 TPDB_API_ASSETS_URL = "https://theposterdb.com/api/assets"
 TPDB_RATE_LIMIT_DELAY = 6  # seconds between requests
 TPDB_USER_UPLOADS_PER_PAGE = 24
+TPDB_COLLECTION_MEDIA_TYPES = [
+    MediaType.COLLECTION,
+    MediaType.PERSON,
+    MediaType.CATEGORY,
+    MediaType.COMPANY
+]
+# A full crawl only tombstones assets it didn't see if it reached at least this share of the
+# user's reported uploads. ThePosterDB's counter runs a little high, so this is below 1.0, but a
+# crawl cut short by a bad page must never be mistaken for a catalogue that shrank.
+RECONCILE_MIN_COVERAGE = 0.9
+
+# Webhook (Sonarr/Radarr on-import trigger)
+WEBHOOK_TOKEN_HEADER = "X-Webhook-Token"
+WEBHOOK_RETRY_DELAYS = [20, 60, 180, 600]  # seconds; retries while the imported item is not yet in Plex
 
 # MediUX configuration
 MEDIUX_BASE_URL = "https://mediux.pro"
@@ -88,7 +149,19 @@ UPDATE_CHECK_INTERVAL = 1800  # 30 minutes
 SCHEDULER_CHECK_INTERVAL = 60  # 1 minute
 
 # File upload
-UPLOAD_CHUNK_SIZE = 8192  # bytes
+UPLOAD_CHUNK_SIZE = 1024 * 512  # bytes
+UPLOAD_CHUNK_TIMEOUT = 10 # seconds
+
+# Network timeouts (seconds)
+DEFAULT_PLEX_CONNECT_TIMEOUT = 10  # PlexConnector.connect()
+DEFAULT_KOMETA_DOWNLOAD_TIMEOUT = 10  # Downloading artwork to save to the Kometa asset directory
+OIDC_REQUEST_TIMEOUT = 10  # Discovery, token exchange and userinfo calls to the identity provider
+
+# Upload retry behaviour: a transient failure (timeout, connection error, 5xx) is retried this many
+# times in total, waiting backoff seconds and doubling that wait after each attempt. A 401 or 404
+# is never transient and is not retried.
+DEFAULT_UPLOAD_RETRY_ATTEMPTS = 3
+DEFAULT_UPLOAD_RETRY_BACKOFF_SECONDS = 1
 
 # Web UI colors (Bootstrap)
 BOOTSTRAP_COLORS = {
@@ -114,8 +187,8 @@ MODE_WEB = "web"
 COMMENT_PREFIXES = ('#', '//')
 
 # File type patterns
-IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png')
-VALID_FILENAME_PATTERN = r'^[^/]+(?:\.jpg|\.jpeg|\.png)$'
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
+VALID_FILENAME_PATTERN = r'^[^/]+(?:\.jpg|\.jpeg|\.png|\.webp)$'
 
 # Status messages
 STATUS_COLORS = {
@@ -124,4 +197,43 @@ STATUS_COLORS = {
     'danger': 'danger',
     'warning': 'warning',
     'info': 'info',
+}
+
+# Events a channel is subscribed to when it is created or migrated from an older config
+# that had no per-event selection. Matches the notifications that were sent before
+# per-event routing existed: scheduled run start, and the completion or cancellation
+# summary, in success or failure.
+DEFAULT_NOTIFICATION_EVENTS = [
+    NotificationEvent.RUN_STARTED.value,
+    NotificationEvent.RUN_COMPLETED.value,
+    NotificationEvent.RUN_COMPLETED_WITH_ERRORS.value,
+    NotificationEvent.RUN_CANCELLED.value,
+]
+
+# RunHistory URL source and type maps for RunHistory UI
+URL_SOURCE_MAP = {
+    "mediux.pro": "MediUX",
+    "theposterdb.com": "TPDb"
+}
+URL_TYPE_MAP = {
+    "set": {
+        "icon": "brush",
+        "label": "Set"
+    },
+    "sets": {
+        "icon": "brush",
+        "label": "Set"
+    },
+    "boxsets": {
+        "icon": "box-seam",
+        "label": "Boxset"
+    },
+    "user": {
+        "icon": "person-circle",
+        "label": "User"
+    },
+    "poster": {
+        "icon": "file-image",
+        "label": "Poster"
+    }
 }

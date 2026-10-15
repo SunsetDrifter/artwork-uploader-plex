@@ -5,20 +5,20 @@ This service handles the business logic of scraping artwork and processing
 it for upload to Plex, separating it from UI/notification concerns.
 """
 
-import os
-import time
+import os, time
 from typing import Optional, Callable, Tuple
-
 from scrapers.scraper import Scraper
 from processors.upload_processor import UploadProcessor
 from plex.plex_connector import PlexConnector
 from models.options import Options
 from models.callbacks import ProcessingCallbacks
 from utils.utils import elapsed_time
+from core import globals
 from core.exceptions import (
     PlexConnectorException,
     ScraperException,
     CollectionNotFound,
+    CollectionsNotSupported,
     MovieNotFound,
     ShowNotFound,
     NotProcessedByFilter,
@@ -35,8 +35,8 @@ class ArtworkProcessor:
     def scrape_and_process(
         self,
         url: str,
-        bulk: bool,
-        options: Options,
+        bulk: dict,
+        options: Options
     ) -> Tuple[Optional[str], Optional[str]]:
         """
         Scrape artwork from a URL and process it for upload to Plex.
@@ -65,10 +65,6 @@ class ArtworkProcessor:
         scraper.set_options(options)
 
         try:
-            if "/boxsets/" in url:
-                pass #self.callbacks.status(f"Scraping MediUX Boxset from {url}, this may take a while...", "info", True, True)
-            else:
-                pass #self.callbacks.status(f"Scraping {url}", "info", True, True)
             start_time = time.time()
             scraper.scrape()
         except ScraperException as e:
@@ -78,6 +74,11 @@ class ArtworkProcessor:
         # Process the scraped artwork
         processor = UploadProcessor(self.plex)
         processor.set_options(options)
+        # allow_artist_updates needs to know which posters belong to the artist being processed.
+        # The cached scrape builds that from the index (tombstones included); otherwise derive it
+        # from what this scrape collected.
+        processor.artist_assets = scraper.artist_assets if getattr(scraper, "artist_assets", None) is not None \
+            else self._artist_assets_from_scrape(scraper)
 
         description = f"TBDb portfolio • {scraper.author}" if "/user" in url else f"{scraper.title} • {scraper.author}"
 
@@ -94,9 +95,22 @@ class ArtworkProcessor:
         
         # Process collections
         n = 1
+        if bulk:
+            index = bulk.get("index", 0)
+            total = bulk.get("total", 0)
+            message = bulk.get("title", "")
+            bulk_start_percent = (index / total)
+            bulk_end_percent = ((index + 1) / total)
+
         title = f"for {scraper.title}" if scraper.title else ""
         for artwork in scraper.collection_artwork:
+            if globals.cancel_scrape:
+                break
             self.callbacks.progress(n, scraper.total - scraper.skipped, f"{description} • {n} of {scraper.total - scraper.skipped}", "main")
+            if bulk:
+                this_percent = (n / (scraper.total - scraper.skipped))
+                bulk_percent = (bulk_start_percent + this_percent * (bulk_end_percent - bulk_start_percent)) * 100
+                self.callbacks.progress(bulk_percent, 100, message, bar_type="bulk")
             n += 1
             self._process_single_artwork(
                 artwork,
@@ -105,7 +119,13 @@ class ArtworkProcessor:
 
         # Process movies
         for artwork in scraper.movie_artwork:
+            if globals.cancel_scrape:
+                break
             self.callbacks.progress(n, scraper.total - scraper.skipped, f"{description} • {n} of {scraper.total - scraper.skipped}", "main")
+            if bulk:
+                this_percent = (n / (scraper.total - scraper.skipped))
+                bulk_percent = (bulk_start_percent + this_percent * (bulk_end_percent - bulk_start_percent)) * 100
+                self.callbacks.progress(bulk_percent, 100, message, bar_type="bulk")
             n += 1
             self._process_single_artwork(
                 artwork,
@@ -114,7 +134,13 @@ class ArtworkProcessor:
 
         # Process TV shows
         for artwork in scraper.tv_artwork:
+            if globals.cancel_scrape:
+                break
             self.callbacks.progress(n, scraper.total - scraper.skipped, f"{description} • {n} of {scraper.total - scraper.skipped}", "main")
+            if bulk:
+                this_percent = (n / (scraper.total - scraper.skipped))
+                bulk_percent = (bulk_start_percent + this_percent * (bulk_end_percent - bulk_start_percent)) * 100
+                self.callbacks.progress(bulk_percent, 100, message, bar_type="bulk")
             n += 1
             self._process_single_artwork(
                 artwork,
@@ -123,11 +149,31 @@ class ArtworkProcessor:
 
         end_time = time.time()
         elapsed = elapsed_time(end_time - start_time)
-        self.callbacks.assets(count=(scraper.total - scraper.skipped))
-        self.callbacks.log(f"✔️ {description} | {scraper.total - scraper.skipped} asset(s) processed in {elapsed} • {self.callbacks.success_counter[0]} asset(s) updated")
-        if not bulk:
-            self.callbacks.status(f"Processed all artwork {title} by {scraper.author}", "success")
+        if globals.cancel_scrape:
+            self.callbacks.progress(1, 1, "", "main")  # nudge to 100% so the frontend clears the bar (it only hides at 100%)
+            self.callbacks.log(f"🛑 {description} | Canceled by user • {self.callbacks.success_counter[0]} asset(s) updated before stopping")
+            if not bulk:
+                self.callbacks.status(f"Process canceled {f'{title} by {scraper.author}' if title else f"for {scraper.author}'s TPDb portfolio"}", "warning")
+        else:
+            failed_note = f" • {self.callbacks.failed_counter[0]} asset(s) failed" if self.callbacks.failed_counter and self.callbacks.failed_counter[0] else ""
+            self.callbacks.log(f"✔️ {description} | {scraper.total - scraper.skipped} asset(s) processed in {elapsed} • {self.callbacks.success_counter[0]} asset(s) updated{failed_note}")
+            if not bulk:
+                self.callbacks.status(f"Process completed {f'{title} by {scraper.author}' if title else f"for {scraper.author}'s TPDb portfolio"}", "success")
         return scraper.title, scraper.author
+
+    @staticmethod
+    def _artist_assets_from_scrape(scraper) -> dict:
+        """Fallback ownership map when there's no cached index: md5(url) -> asset id for every
+           poster this scrape collected. Enough to recognise artwork we applied from the same
+           run's artist; an asset the artist has since removed just falls back to protected."""
+        from utils.utils import calculate_md5
+        mapping = {}
+        for artwork in (scraper.movie_artwork + scraper.tv_artwork + scraper.collection_artwork):
+            url = artwork.get("url")
+            asset_id = artwork.get("id")
+            if url and str(asset_id).isdigit():
+                mapping[calculate_md5(url.split("&_cb=")[0])] = int(asset_id)
+        return mapping
 
     def _process_single_artwork(
         self,
@@ -143,27 +189,19 @@ class ArtworkProcessor:
             callbacks: Optional callbacks for UI updates
         """
         try:
-            # Update status if callback provided
-            # self.callbacks.status(
-            #     f'Processing artwork for {artwork["title"]}',
-            #     "info",
-            #     True,  # spinner
-            #     True   # sticky
-            # )
-
             # Process the artwork
             results = process_func(artwork)
 
-            for result in results:
-            # Track successful uploads (those starting with ✅ or ♻️)
-                if result.startswith('✅') or result.startswith('♻️'):
-                    self.callbacks.success(1)
-
             # Log the result
+            for result in results:
+                self.callbacks.record_result(result)
                 self.callbacks.log(result)
 
         except CollectionNotFound as e:
             self.callbacks.log(f"⚠️ {str(e)}")
+
+        except CollectionsNotSupported as e:
+            self.callbacks.log(f"⏩ {str(e)}")
 
         except MovieNotFound as e:
             self.callbacks.log(f"⚠️ {str(e)}")
@@ -173,15 +211,15 @@ class ArtworkProcessor:
 
         except ScraperException as e:
             self.callbacks.log(f"❌ {str(e)}")
-            self.callbacks.debug(f"ScraperException: {str(e)}", "ArtworkProcessor/_process_single_artwork")
+            self.callbacks.debug(f"ScraperException: {str(e)}")
 
         except PlexConnectorException as e:
             self.callbacks.log(f"❌ {str(e)}")
-            self.callbacks.debug(f"PlexConnectorException: {str(e)}", "ArtworkProcessor/_process_single_artwork")
+            self.callbacks.debug(f"PlexConnectorException: {str(e)}")
 
         except Exception as e:
             self.callbacks.log(f"❌ {str(e)}")
-            self.callbacks.debug(f"Error processing {artwork["title"]} ({artwork["year"]}):{str(e)}", "ArtworkProcessor/_process_single_artwork")
+            self.callbacks.debug(f"Error processing {artwork["title"]} ({artwork["year"]}):{str(e)}")
             self.callbacks.status(
                 f"Error: {str(e)}",
                 "danger",
@@ -222,15 +260,17 @@ class ArtworkProcessor:
             # We determine if it's a single movie/TV ZIP by checking if the title of the ZIP file is part of the title of the first file
             # Otherwise we assume it's a ZIP file containing artwork for multiple shows/movies/collections and leave year as None
             year = file_list[0].get('year', 'unknown') if title in file_list[0].get('title', 'unknown') else None
-            self.callbacks.debug(f"Processing {total_files} files from {source} ZIP file for {title}{f' ({year})' if year else ''}", "process_uploaded_artwork")
+            self.callbacks.debug(f"Processing {total_files} files from {source} ZIP file for {title}{f' ({year})' if year else ''}")
         else:
             year = None
-            self.callbacks.debug("No files to process in uploaded ZIP file", "process_uploaded_artwork")
+            self.callbacks.debug("No files to process in uploaded ZIP file")
         
+        processed_files = 0
         success_counter = 0  # Mutable counter to track successful uploads
+        failed_counter = 0  # Mutable counter to track uploads that failed after exhausting their retries
 
         # Initial progress update
-        self.callbacks.debug("Processing uploaded file...", "process_uploaded_artwork")
+        self.callbacks.debug("Processing uploaded file...")
         self.callbacks.progress(0, total_files, "Processing ZIP file")
 
         self.callbacks.log(f"⚙️ {title}{f' ({year})' if year else ''} • {author} | Obtained {total_files + skipped} asset(s) from uploaded {'MediUX' if source=="mediux" else 'TPDb'} ZIP file.")
@@ -238,6 +278,8 @@ class ArtworkProcessor:
             self.callbacks.log(f"⏩ {title}{f' ({year})' if year else ''} • {author} | Skipping {skipped} asset(s) based on filters. Processing {total_files} asset(s).")
 
         for index, artwork in enumerate(file_list, start=1):
+            if globals.cancel_scrape:
+                break
             # Update progress
             self.callbacks.progress(index, total_files, f"Processing ZIP file • {index} of {total_files}")
             # Override title if provided
@@ -254,13 +296,13 @@ class ArtworkProcessor:
             elif media_type == "TV Show":
                 process_func = processor.process_tv_artwork
             elif media_type == "unavailable":
-                self.callbacks.log(f"⚠️ {artwork['title']} {f"({artwork['year']})" if artwork.get('year') else ''} : {artwork['author']} | Not available on Plex.")
+                self.callbacks.log(f"⚠️ {artwork['title']} {f"({artwork['year']})" if artwork.get('year') else ''} : {artwork['author']} | Movie or TV Show not available on Plex")
                 os.remove(artwork['path'])  # Remove the temporary file after processing
                 try:
                     os.rmdir(os.path.dirname(artwork['path']))  # Remove the temporary directory if empty
-                    self.callbacks.debug(f"Deleted temporary directory: {os.path.dirname(artwork['path'])}", "process_uploaded_artwork")
+                    self.callbacks.debug(f"Deleted temporary directory: {os.path.dirname(artwork['path'])}")
                 except OSError as e:
-                    self.callbacks.debug(f"Error deleting temporary directory: {os.path.dirname(artwork['path'])} - {str(e)}", "process_uploaded_artwork")
+                    self.callbacks.debug(f"Error deleting temporary directory: {os.path.dirname(artwork['path'])} - {str(e)}")
                     pass
                 continue
             else:
@@ -273,7 +315,7 @@ class ArtworkProcessor:
             status_msg = f'Processing {media_type.lower()} artwork for "{artwork["title"]}"{season_info}{episode_info}'
 
             # Debug logging
-            self.callbacks.debug(status_msg, "process_uploaded_artwork")
+            self.callbacks.debug(status_msg)
 
             # Update status
             self.callbacks.status(
@@ -286,14 +328,15 @@ class ArtworkProcessor:
             # Process the artwork if media_type is known
             if media_type != "unavailable":
                 try:
+                    processed_files += 1
                     results = process_func(artwork)
 
                     for result in results:
-                        # Track successful uploads (those starting with ✅ or ♻️)
-                        if result.startswith('✅') or result.startswith('♻️'):
+                        counted = self.callbacks.record_result(result)
+                        if counted == "success":
                             success_counter += 1
-
-                        # Log the result
+                        elif counted == "failed":
+                            failed_counter += 1
                         self.callbacks.log(result)
 
                 except CollectionNotFound as e:
@@ -315,15 +358,21 @@ class ArtworkProcessor:
                     self.callbacks.log(f"❌ {str(e)}")
             try:
                 os.remove(artwork['path'])  # Remove the temporary file after processing
-                self.callbacks.debug(f"Deleted temporary file: {artwork['path']}", "process_uploaded_artwork")
+                self.callbacks.debug(f"Deleted temporary file: {artwork['path']}")
             except OSError as e:
-                self.callbacks.debug(f"Failed to delete temporary file: {artwork['path']} - {str(e)}", "process_uploaded_artwork")
+                self.callbacks.debug(f"Failed to delete temporary file: {artwork['path']} - {str(e)}")
                 pass
             try:
                 os.rmdir(os.path.dirname(artwork['path']))  # Remove the temporary directory if empty
-                self.callbacks.debug(f"Deleted temporary directory: {os.path.dirname(artwork['path'])}", "process_uploaded_artwork")
+                self.callbacks.debug(f"Deleted temporary directory: {os.path.dirname(artwork['path'])}")
             except OSError:
                 pass
         # Final progress update
-        self.callbacks.log(f"✔️ {title}{f' ({year})' if year else ''} • {author} | {total_files} file(s) processed • {success_counter} asset(s) updated.")
-        self.callbacks.progress(total_files, total_files, f"Processing ZIP file • {total_files} of {total_files}")
+        failed_note = f" • {failed_counter} asset(s) failed" if failed_counter else ""
+        if globals.cancel_scrape:
+            self.callbacks.progress(1, 1, "", "main")
+            self.callbacks.log(f"🛑 {title}{f' ({year})' if year else ''} • {author} | Stopped by user. {processed_files} file(s) processed • {success_counter} asset(s) updated{failed_note}.")
+
+        else:
+            self.callbacks.log(f"✔️ {title}{f' ({year})' if year else ''} • {author} | {total_files} file(s) processed • {success_counter} asset(s) updated{failed_note}.")
+            self.callbacks.progress(total_files, total_files, f"Processing ZIP file • {total_files} of {total_files}")
